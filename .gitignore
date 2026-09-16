@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.vscode/
+runs/
+fail_runs/
+logs/
+papers/
+*.pt
+*.mp4

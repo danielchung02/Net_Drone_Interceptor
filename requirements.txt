@@ -1,0 +1,5 @@
+# Python 3.10/3.11 recommended. RotorPy installs its own NumPy/SciPy stack.
+torch>=1.11
+gymnasium
+rotorpy==2.1.3
+matplotlib
