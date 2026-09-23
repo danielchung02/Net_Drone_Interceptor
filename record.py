@@ -31,12 +31,24 @@ def load_actor(agent_name: str, saved, checkpoint, observation_dim: int, action_
     if agent_name == "ppo":
         hyperparameters = PPOHyperParameters()
         restore_hyperparameters(saved, agent_name, hyperparameters)
-        actor = PPOActorCritic(observation_dim, action_dim, hyperparameters.hidden_dim)
+        actor = PPOActorCritic(
+            observation_dim,
+            action_dim,
+            hyperparameters.hidden_dim,
+            hyperparameters.min_log_std,
+            hyperparameters.max_log_std,
+        )
         actor.load_state_dict(checkpoint["model"])
     elif agent_name == "a2c":
         hyperparameters = A2CHyperParameters()
         restore_hyperparameters(saved, agent_name, hyperparameters)
-        actor = A2CActorCritic(observation_dim, action_dim, hyperparameters.hidden_dim)
+        actor = A2CActorCritic(
+            observation_dim,
+            action_dim,
+            hyperparameters.hidden_dim,
+            hyperparameters.min_log_std,
+            hyperparameters.max_log_std,
+        )
         actor.load_state_dict(checkpoint["model_state_dict"])
     elif agent_name == "ddpg":
         hyperparameters = DDPGHyperParameters()
@@ -72,12 +84,17 @@ def main() -> None:
     parser.add_argument("--mode", choices=["pn", "e2e"], default="pn")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--scenario-seed", type=int, default=10_000)
-    parser.add_argument("--checkpoint", choices=["best", "last"], default="best")
+    parser.add_argument(
+        "--checkpoint",
+        choices=["best", "last", "stage0_best", "stage1_best"],
+        default="best",
+    )
     parser.add_argument("--physics-engine", choices=["rotorpy", "simple"], default=None)
+    parser.add_argument("--run-root", default="runs")
     parser.add_argument("--no-video", action="store_true")
     args = parser.parse_args()
 
-    run_dir = Path("runs") / args.mode / args.agent
+    run_dir = Path(args.run_root) / args.mode / args.agent
     prefix = "seed_{}".format(args.seed)
     with (run_dir / "{}_config.json".format(prefix)).open(encoding="utf-8") as file:
         saved = json.load(file)
@@ -89,6 +106,12 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint_path = run_dir / "{}_{}.pt".format(prefix, args.checkpoint)
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    config.launch_curriculum_stage = int(
+        checkpoint.get("launch_curriculum_stage", config.launch_curriculum_stage)
+    )
+    config.curriculum_success_streak = int(
+        checkpoint.get("curriculum_success_streak", 0)
+    )
     actor = load_actor(
         args.agent,
         saved,

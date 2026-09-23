@@ -150,7 +150,7 @@ class InterceptionEnv(gym.Env):
     """One encounter inside an empty sphere; no official timeout exists."""
 
     #metadata = {"render_modes": ["none"], "render_fps": 20} #rendering 안할거면 없어도 됨
-    observation_dim = 17 #상대위치(3) 상대속도(3) 요격기속도(3) 요격기자세쿼터니언(4) 요격기각속도(3) 넷발사여부(1)
+    observation_dim = 26 #상대위치(3) 상대속도(3) 요격기위치(3) 요격기속도(3) 요격기자세쿼터니언(4) 요격기각속도(3) 직전가속도(3) 시간(1) 넷발사여부(1) gate(1) curriculum(1)
 
     def __init__(self, config: ExperimentConfig):
         super().__init__()
@@ -189,7 +189,12 @@ class InterceptionEnv(gym.Env):
         self.min_net_distance = float("inf") #episode 동안 기록한 그물과 타겟 간 최소거리
         self.control_effort = 0.0 #sum(요격기의 accelerator^2 * dt)
         self.launch_distance = float("nan") #발사 시점의 요격기-타겟 거리
+        self.launch_time = float("nan")
+        self.launch_source: Optional[str] = None
         self.capture_time = float("nan")
+        self.gate_ever_open = False
+        self.gate_open_steps = 0
+        self.first_gate_time = float("nan")
         self.reason: Optional[str] = None #종료 사유(hit, miss, target_exit interceptor_exit, debug_guard)
         self.history = {"time": [], "target": [], "interceptor": [], "net": []}
 
@@ -232,20 +237,90 @@ class InterceptionEnv(gym.Env):
         vertical_axis = unit(np.cross(direction, horizontal_axis))
         return horizontal_axis, vertical_axis
 
-    def decode_action(self, action: np.ndarray) -> Tuple[np.ndarray, np.ndarray, bool]:
+    def line_of_sight_basis(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        line_of_sight = unit(self.target.position - self.interceptor.position)
+        reference_up = np.array([0.0, 0.0, 1.0])
+        if abs(float(np.dot(reference_up, line_of_sight))) > 0.9:
+            reference_up = np.array([0.0, 1.0, 0.0])
+        horizontal_axis = unit(np.cross(reference_up, line_of_sight))
+        vertical_axis = unit(np.cross(line_of_sight, horizontal_axis))
+        return line_of_sight, horizontal_axis, vertical_axis
+
+    def ballistic_launch_direction(self) -> np.ndarray:
+        """Constant-velocity ballistic lead used directly as the launch direction."""
+
+        relative_position = self.target.position - self.interceptor.position
+        relative_velocity = self.target.velocity - self.interceptor.velocity
+        gravity = np.array([0.0, 0.0, -GRAVITY])
+        flight_time = max(float(np.linalg.norm(relative_position)) / self.config.net_speed, 0.01)
+        required_displacement = relative_position.copy()
+        for _ in range(8):
+            required_displacement = (
+                relative_position
+                + relative_velocity * flight_time
+                - 0.5 * gravity * flight_time**2
+            )
+            updated_time = float(np.linalg.norm(required_displacement)) / self.config.net_speed
+            flight_time = 0.5 * flight_time + 0.5 * max(updated_time, 0.01)
+        return unit(required_displacement)
+
+    def engagement_values(self) -> Tuple[float, float]:
+        relative_position = self.target.position - self.interceptor.position
+        relative_velocity = self.target.velocity - self.interceptor.velocity
+        distance = max(float(np.linalg.norm(relative_position)), EPS)
+        line_of_sight = relative_position / distance
+        closing_speed = -float(np.dot(relative_velocity, line_of_sight))
+        return distance, closing_speed
+
+    def launch_gate_open(self) -> bool:
+        """Rule-based launch timing, evaluated once at each control step."""
+
+        distance, closing_speed = self.engagement_values()
+        if distance > self.config.fixed_auto_launch_distance:
+            return False
+        if closing_speed < self.config.launch_gate_min_closing_speed:
+            return False
+        return True
+
+    def uses_rl_aim(self) -> bool:
+        """PN always learns aim; E2E learns it only after curriculum stage 0."""
+
+        return self.config.mode == "pn" or self.config.launch_curriculum_stage == 1
+
+    def action_mask(self) -> np.ndarray:
+        """Mark action dimensions that can affect the current transition."""
+
+        aim_active = float(self.uses_rl_aim() and self.launch_gate_open())
+        if self.config.mode == "pn":
+            return np.array([aim_active, aim_active], dtype=np.float32)
+        return np.array([1.0, 1.0, 1.0, aim_active, aim_active], dtype=np.float32)
+
+    def decode_action(self, action: np.ndarray) -> Tuple[np.ndarray, np.ndarray, str]:
+        line_of_sight, horizontal_axis, vertical_axis = self.line_of_sight_basis()
         if self.config.mode == "pn":
             desired = self.pn_acceleration()
-            launch_values = action
+            aim_values = action[:2]
         else:
-            desired = action[:3].astype(np.float64) * self.config.interceptor_max_acceleration
-            launch_values = action[3:]
-        azimuth = float(np.pi * launch_values[0])
-        elevation = float(0.5 * np.pi * launch_values[1])
-        launch_direction = np.array(
-            [np.cos(elevation) * np.cos(azimuth), np.cos(elevation) * np.sin(azimuth), np.sin(elevation)]
+            acceleration_values = action[:3].astype(np.float64)
+            desired = self.config.interceptor_max_acceleration * (
+                acceleration_values[0] * line_of_sight
+                + acceleration_values[1] * horizontal_axis
+                + acceleration_values[2] * vertical_axis
+            )
+            desired = clip_norm(desired, self.config.interceptor_max_acceleration)
+            aim_values = action[3:5]
+
+        if not self.uses_rl_aim():
+            return desired, self.ballistic_launch_direction(), "rule_aim"
+
+        azimuth = self.config.launch_azimuth_limit * float(aim_values[0])
+        elevation = self.config.launch_elevation_limit * float(aim_values[1])
+        launch_direction = (
+            np.cos(elevation) * np.cos(azimuth) * line_of_sight
+            + np.cos(elevation) * np.sin(azimuth) * horizontal_axis
+            + np.sin(elevation) * vertical_axis
         )
-        fire = bool(launch_values[2] > 0.0)
-        return desired, launch_direction, fire
+        return desired, unit(launch_direction), "rl_aim"
 
     def pn_acceleration(self) -> np.ndarray:
         relative_position = self.target.position - self.interceptor.position
@@ -268,12 +343,56 @@ class InterceptionEnv(gym.Env):
         command = speed_acceleration + lateral_acceleration
         return clip_norm(command, self.config.interceptor_max_acceleration)
 
-    def launch(self, direction: np.ndarray) -> None:
+    def launch(self, direction: np.ndarray, source: str) -> None:
         self.launch_used = True
+        self.launch_source = source
         self.launch_position = self.interceptor.position.copy()
         self.net_position = self.launch_position.copy()
         self.net_velocity = self.interceptor.velocity.copy() + self.config.net_speed * unit(direction)
         self.launch_distance = float(np.linalg.norm(self.target.position - self.interceptor.position))
+        self.launch_time = self.time
+
+    def resolve_launched_net(self) -> str:
+        """After launch, stop the interceptor and finish the ballistic outcome internally."""
+
+        substeps_since_history = 0
+        while True:
+            before_target = self.target.position.copy()
+            before_net = self.net_position.copy()
+            target_desired = self.target_acceleration()
+            target_acceleration = self.jerk_limited(
+                target_desired,
+                self.last_target_acceleration,
+                self.config.target_max_acceleration,
+                self.config.target_max_jerk,
+            )
+            self.target.step(target_acceleration, self.config.physics_dt)
+            self.last_target_acceleration = target_acceleration
+            self.net_velocity += np.array([0.0, 0.0, -GRAVITY]) * self.config.physics_dt
+            self.net_position += self.net_velocity * self.config.physics_dt
+            self.time += self.config.physics_dt
+            substeps_since_history += 1
+
+            relative_start = before_net - before_target
+            relative_end = self.net_position - self.target.position
+            self.min_net_distance = min(
+                self.min_net_distance,
+                segment_distance(relative_start, relative_end),
+            )
+            reason = None
+            if is_hit(relative_start, relative_end, self.config.net_capture_radius):
+                self.capture_time = self.time
+                reason = "hit"
+            elif np.linalg.norm(self.net_position) > self.config.sphere_radius:
+                reason = "miss"
+            elif np.linalg.norm(self.target.position) > self.config.sphere_radius:
+                reason = "miss"
+
+            if substeps_since_history >= self.config.physics_substeps or reason is not None:
+                self.append_history()
+                substeps_since_history = 0
+            if reason is not None:
+                return reason
 
     def physics_step(self, desired_interceptor_acceleration: np.ndarray) -> Optional[str]:
         interceptor_acceleration = self.jerk_limited(
@@ -347,10 +466,15 @@ class InterceptionEnv(gym.Env):
             [
                 (self.target.position - self.interceptor.position) / self.config.sphere_radius,
                 (self.target.velocity - self.interceptor.velocity) / self.config.target_max_speed,
+                self.interceptor.position / self.config.sphere_radius,
                 self.interceptor.velocity / self.config.interceptor_max_speed,
                 self.interceptor.quaternion,
                 self.interceptor.angular_velocity / 10.0,
+                self.last_interceptor_acceleration / self.config.interceptor_max_acceleration,
+                np.array([self.time / self.config.reference_time]),
                 np.array([float(self.launch_used)]),
+                np.array([float(self.launch_gate_open())]),
+                np.array([float(self.config.launch_curriculum_stage)]),
             ]
         )
         return values.astype(np.float32)
@@ -365,7 +489,16 @@ class InterceptionEnv(gym.Env):
             "min_net_distance": self.min_net_distance,
             "control_effort": self.control_effort,
             "launch_distance": self.launch_distance,
+            "launch_time": self.launch_time,
             "launch_used": self.launch_used,
+            "launch_source": self.launch_source,
+            "rule_aim": self.launch_source == "rule_aim",
+            "rl_aim": self.launch_source == "rl_aim",
+            "gate_ever_open": self.gate_ever_open,
+            "gate_open_steps": self.gate_open_steps,
+            "first_gate_time": self.first_gate_time,
+            "curriculum_stage": self.config.launch_curriculum_stage,
+            "action_mask": self.action_mask(),
         }
 
     def append_history(self) -> None:
@@ -378,25 +511,44 @@ class InterceptionEnv(gym.Env):
     def step(self, action: np.ndarray):
         action = np.asarray(action, dtype=np.float32)
         action = np.clip(action, -1.0, 1.0)
+        before_time = self.time
         before_distance = float(np.linalg.norm(self.target.position - self.interceptor.position))
-        desired_acceleration, launch_direction, fire = self.decode_action(action)
-        if not self.launch_used and fire:
-            self.launch(launch_direction)
+        gate_open = self.launch_gate_open()
+        if gate_open:
+            self.gate_open_steps += 1
+            if not self.gate_ever_open:
+                self.gate_ever_open = True
+                self.first_gate_time = self.time
+        desired_acceleration, launch_direction, launch_source = self.decode_action(action)
+        launched_now = not self.launch_used and gate_open
+        if launched_now:
+            self.launch(launch_direction, launch_source)
 
-        reason = None
-        for substep in range(self.config.physics_substeps):
-            reason = self.physics_step(desired_acceleration)
-            if reason is not None:
-                break
+        if launched_now:
+            reason = self.resolve_launched_net()
+        else:
+            reason = None
+            for substep in range(self.config.physics_substeps):
+                reason = self.physics_step(desired_acceleration)
+                if reason is not None:
+                    break
 
         self.step_count += 1
-        self.append_history()
+        if not launched_now:
+            self.append_history()
         after_distance = float(np.linalg.norm(self.target.position - self.interceptor.position))
         self.min_distance = min(self.min_distance, after_distance)
         self.reason = reason
-        self.control_effort += float(np.dot(self.last_interceptor_acceleration, self.last_interceptor_acceleration)) * self.config.control_dt
-        reward = 0.5 * (before_distance - after_distance) / self.config.sphere_radius
-        reward -= self.config.time_penalty_scale * self.config.control_dt / self.config.reference_time
+        if not launched_now:
+            self.control_effort += float(np.dot(self.last_interceptor_acceleration, self.last_interceptor_acceleration)) * self.config.control_dt
+        elapsed_time = self.time - before_time
+        time_penalty = self.config.time_penalty_scale * elapsed_time / self.config.reference_time
+        approach_reward = 0.0
+        if not launched_now:
+            approach_reward = self.config.approach_progress_scale * (
+                before_distance - after_distance
+            ) / self.config.sphere_radius
+        reward = approach_reward - time_penalty
 
         terminated = reason is not None
         truncated = False
@@ -406,20 +558,44 @@ class InterceptionEnv(gym.Env):
             )
             reward = self.config.terminal_reward + self.config.capture_time_bonus * remaining_time_fraction
         elif reason == "miss":
-            reward = -self.config.miss_penalty + self.near_miss_reward()
+            reward = (
+                -self.config.miss_penalty
+                + self.near_miss_reward()
+                - time_penalty
+                - self.remaining_time_penalty()
+            )
         elif reason == "target_exit":
             if self.launch_used:
-                reward = -self.config.miss_penalty + self.near_miss_reward()
+                reward = (
+                    -self.config.miss_penalty
+                    + self.near_miss_reward()
+                    - time_penalty
+                    - self.remaining_time_penalty()
+                )
             else:
-                reward = -self.config.passive_exit_penalty
+                reward = (
+                    -self.config.passive_exit_penalty
+                    - time_penalty
+                    - self.remaining_time_penalty()
+                )
         elif reason == "interceptor_exit":
-            reward = -self.config.passive_exit_penalty
+            reward = (
+                -self.config.interceptor_exit_penalty
+                - time_penalty
+                - self.remaining_time_penalty()
+            )
         elif self.config.debug_max_steps and self.step_count >= self.config.debug_max_steps:
             # Never use this in the thesis result.  It is a true truncation,
             # so PPO may bootstrap from the returned final observation.
             truncated = True
             self.reason = "debug_guard"
         return self.observation(), float(reward), terminated, truncated, self.info()
+
+    def remaining_time_penalty(self) -> float:
+        remaining_fraction = float(
+            np.clip(1.0 - self.time / self.config.reference_time, 0.0, 1.0)
+        )
+        return self.config.time_penalty_scale * remaining_fraction
 
     def near_miss_reward(self) -> float:
         if not np.isfinite(self.min_net_distance):
@@ -431,12 +607,22 @@ class InterceptionEnv(gym.Env):
         return {name: np.asarray(values) for name, values in self.history.items()}
 
     def heuristic_action(self) -> np.ndarray:
-        """Deterministic feasibility check: launch once directly toward target."""
+        """Deterministic feasibility check with the analytic ballistic direction."""
 
-        direction = unit(self.target.position - self.interceptor.position)
-        azimuth = np.arctan2(direction[1], direction[0]) / np.pi
-        elevation = np.arcsin(direction[2]) / (0.5 * np.pi)
-        launch = np.array([azimuth, np.clip(elevation, -1.0, 1.0), 1.0], dtype=np.float32)
+        line_of_sight, horizontal_axis, vertical_axis = self.line_of_sight_basis()
+        direction = self.ballistic_launch_direction()
+        elevation = np.arcsin(np.clip(np.dot(direction, vertical_axis), -1.0, 1.0))
+        azimuth = np.arctan2(
+            np.dot(direction, horizontal_axis),
+            np.dot(direction, line_of_sight),
+        )
+        aim = np.array(
+            [
+                np.clip(azimuth / self.config.launch_azimuth_limit, -1.0, 1.0),
+                np.clip(elevation / self.config.launch_elevation_limit, -1.0, 1.0),
+            ],
+            dtype=np.float32,
+        )
         if self.config.mode == "pn":
-            return launch
-        return np.concatenate([np.zeros(3, dtype=np.float32), launch])
+            return aim
+        return np.concatenate([np.zeros(3, dtype=np.float32), aim])

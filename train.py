@@ -17,7 +17,7 @@ def arguments():
     parser.add_argument("--agent", choices=["ppo", "a2c", "ddpg", "td3", "sac"], default="ppo")
     parser.add_argument("--mode", choices=["pn", "e2e"], default="pn")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--total-steps", type=int, default=None)
+    parser.add_argument("--total-steps", type=int, default=None, help="omit to train until manually interrupted")
     parser.add_argument("--eval-interval", type=int, default=None)
     parser.add_argument("--save-interval", type=int, default=None)
     parser.add_argument("--eval-episodes", type=int, default=None)
@@ -90,6 +90,9 @@ def main() -> None:
     args = arguments()
     config = ExperimentConfig()
     config.mode = args.mode
+    # PN has rule-based guidance and timing, so it starts directly with RL aim.
+    # E2E first learns guidance while the analytic ballistic aim acts as teacher.
+    config.launch_curriculum_stage = 1 if args.mode == "pn" else 0
     config.seed = args.seed
     if args.total_steps is not None:
         config.total_train_steps = args.total_steps
@@ -107,8 +110,6 @@ def main() -> None:
     config.resume = args.resume
     if args.additional_steps is not None:
         config.additional_train_steps = args.additional_steps
-    if config.resume and config.additional_train_steps <= 0:
-        raise ValueError("--resume requires a positive --additional-steps")
     if config.resume and config.overwrite:
         raise ValueError("--resume and --overwrite cannot be used together")
     if config.resume:
@@ -117,7 +118,10 @@ def main() -> None:
     if args.sanity:
         run_sanity(config)
     else:
-        train_selected_agent(args.agent, config)
+        try:
+            train_selected_agent(args.agent, config)
+        except KeyboardInterrupt:
+            print("training interrupted; last.pt was saved")
 
 
 if __name__ == "__main__":

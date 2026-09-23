@@ -26,6 +26,7 @@ TRAIN_METRIC_FIELDS = [
 
 EVAL_METRIC_FIELDS = [
     "total_steps",
+    "curriculum_stage",
     "success_rate",
     "mean_return",
     "mean_capture_time",
@@ -33,6 +34,17 @@ EVAL_METRIC_FIELDS = [
     "mean_min_net_distance",
     "mean_effort",
     "mean_launch_distance",
+    "launch_rate",
+    "rule_aim_rate",
+    "rl_aim_rate",
+    "mean_launch_time",
+    "gate_open_rate",
+    "mean_gate_open_steps",
+    "mean_first_gate_time",
+    "hit_rate",
+    "miss_rate",
+    "target_exit_rate",
+    "interceptor_exit_rate",
 ]
 
 
@@ -75,6 +87,14 @@ def evaluate_episodes(
     min_net_distances: List[float] = []
     efforts: List[float] = []
     launch_distances: List[float] = []
+    launch_times: List[float] = []
+    launch_used: List[float] = []
+    rule_aims: List[float] = []
+    rl_aims: List[float] = []
+    gate_opened: List[float] = []
+    gate_open_steps: List[float] = []
+    first_gate_times: List[float] = []
+    reasons: List[str] = []
 
     for scenario_seed in config.eval_seed_bank[: config.n_eval_episodes]:
         state, _ = env.reset(seed=int(scenario_seed))
@@ -95,14 +115,24 @@ def evaluate_episodes(
         min_net_distances.append(float(info["min_net_distance"]))
         efforts.append(float(info["control_effort"]))
         launch_distances.append(float(info["launch_distance"]))
+        launch_times.append(float(info["launch_time"]))
+        launch_used.append(float(info["launch_used"]))
+        rule_aims.append(float(info["rule_aim"]))
+        rl_aims.append(float(info["rl_aim"]))
+        gate_opened.append(float(info["gate_ever_open"]))
+        gate_open_steps.append(float(info["gate_open_steps"]))
+        first_gate_times.append(float(info["first_gate_time"]))
+        reasons.append(str(info["termination_reason"]))
 
     def finite_mean(values: List[float]) -> float:
         values_array = np.asarray(values, dtype=np.float64)
-        if np.any(np.isfinite(values_array)):
-            return float(np.nanmean(values_array))
+        finite_values = values_array[np.isfinite(values_array)]
+        if finite_values.size:
+            return float(np.mean(finite_values))
         return float("nan")
 
     return {
+        "curriculum_stage": float(config.launch_curriculum_stage),
         "success_rate": float(np.mean(successes)),
         "mean_return": float(np.mean(returns)),
         "mean_capture_time": finite_mean(capture_times),
@@ -110,6 +140,17 @@ def evaluate_episodes(
         "mean_min_net_distance": finite_mean(min_net_distances),
         "mean_effort": float(np.mean(efforts)),
         "mean_launch_distance": finite_mean(launch_distances),
+        "launch_rate": float(np.mean(launch_used)),
+        "rule_aim_rate": float(np.mean(rule_aims)),
+        "rl_aim_rate": float(np.mean(rl_aims)),
+        "mean_launch_time": finite_mean(launch_times),
+        "gate_open_rate": float(np.mean(gate_opened)),
+        "mean_gate_open_steps": float(np.mean(gate_open_steps)),
+        "mean_first_gate_time": finite_mean(first_gate_times),
+        "hit_rate": float(np.mean([reason == "hit" for reason in reasons])),
+        "miss_rate": float(np.mean([reason == "miss" for reason in reasons])),
+        "target_exit_rate": float(np.mean([reason == "target_exit" for reason in reasons])),
+        "interceptor_exit_rate": float(np.mean([reason == "interceptor_exit" for reason in reasons])),
     }
 
 

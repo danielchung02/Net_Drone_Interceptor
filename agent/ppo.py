@@ -5,12 +5,14 @@ evaluation, and checkpoint logic so PPO can be studied as one unit.
 """
 
 import json
+import math
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Normal
 
@@ -42,42 +44,80 @@ class PPOHyperParameters:
         self.clip_coef = 0.20
         self.value_coef = 0.5
         self.entropy_coef = 1e-3
-        self.max_grad_norm = 10.0
+        self.min_log_std = -5.0
+        self.max_log_std = 1.0
+        self.max_grad_norm = 0.5
 
     def to_dict(self) -> Dict[str, object]:
         return self.__dict__.copy()
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, observation_dim: int, action_dim: int, hidden_dim: int):
+    def __init__(
+        self,
+        observation_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        min_log_std: float = -5.0,
+        max_log_std: float = 1.0,
+    ):
         super().__init__()
-        self.features = nn.Sequential(
+        self.actor_features = nn.Sequential(
+            nn.Linear(observation_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+        )
+        self.critic_features = nn.Sequential(
             nn.Linear(observation_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
         )
         self.actor_mean = nn.Linear(hidden_dim, action_dim)
         self.critic = nn.Linear(hidden_dim, 1)
         self.log_std = nn.Parameter(torch.full((action_dim,), -0.5))
+        self.min_log_std = min_log_std
+        self.max_log_std = max_log_std
 
     def forward(self, states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        features = self.features(states)
-        mean = self.actor_mean(features)
-        return mean, self.log_std.expand_as(mean), self.critic(features).squeeze(-1)
+        actor_features = self.actor_features(states)
+        critic_features = self.critic_features(states)
+        mean = self.actor_mean(actor_features)
+        bounded_log_std = torch.clamp(self.log_std, self.min_log_std, self.max_log_std)
+        return mean, bounded_log_std.expand_as(mean), self.critic(critic_features).squeeze(-1)
 
-    def sample_action(self, states: torch.Tensor):
+    def clamp_log_std(self) -> None:
+        """Keep the learned exploration scale inside PPO's numerical range."""
+
+        with torch.no_grad():
+            self.log_std.clamp_(self.min_log_std, self.max_log_std)
+
+    @staticmethod
+    def squashed_log_prob(distribution: Normal, raw_actions: torch.Tensor) -> torch.Tensor:
+        """Per-dimension tanh-Gaussian log probability with a stable Jacobian."""
+
+        log_tanh_jacobian = 2.0 * (
+            math.log(2.0) - raw_actions - F.softplus(-2.0 * raw_actions)
+        )
+        return distribution.log_prob(raw_actions) - log_tanh_jacobian
+
+    def sample_action(self, states: torch.Tensor, action_masks: torch.Tensor):
         mean, log_std, values = self(states)
-        distribution = Normal(mean, torch.exp(torch.clamp(log_std, -20.0, 2.0)))
+        distribution = Normal(mean, torch.exp(log_std))
         raw_actions = distribution.rsample()
         actions = torch.tanh(raw_actions)
-        log_probs = (distribution.log_prob(raw_actions) - torch.log(1.0 - actions.pow(2) + 1e-6)).sum(-1)
-        return actions, raw_actions, log_probs, -log_probs, values
+        per_dimension = self.squashed_log_prob(distribution, raw_actions)
+        log_probs = (per_dimension * action_masks).sum(-1)
+        entropy = (distribution.entropy() * action_masks).sum(-1)
+        return actions, raw_actions, log_probs, entropy, values
 
-    def evaluate_actions(self, states: torch.Tensor, raw_actions: torch.Tensor):
+    def evaluate_actions(self, states: torch.Tensor, raw_actions: torch.Tensor, action_masks: torch.Tensor):
         mean, log_std, values = self(states)
-        distribution = Normal(mean, torch.exp(torch.clamp(log_std, -20.0, 2.0)))
-        actions = torch.tanh(raw_actions)
-        log_probs = (distribution.log_prob(raw_actions) - torch.log(1.0 - actions.pow(2) + 1e-6)).sum(-1)
-        return log_probs, -log_probs, values
+        distribution = Normal(mean, torch.exp(log_std))
+        per_dimension = self.squashed_log_prob(distribution, raw_actions)
+        log_probs = (per_dimension * action_masks).sum(-1)
+        # The base Gaussian entropy is a stable approximation to the entropy
+        # after tanh squashing.  It must not be replaced by -log_prob of the
+        # fixed old rollout action, which drives log_std toward numerical failure.
+        entropy = (distribution.entropy() * action_masks).sum(-1)
+        return log_probs, entropy, values
 
     def deterministic_action(self, states: torch.Tensor) -> torch.Tensor:
         mean, _, _ = self(states)
@@ -93,6 +133,8 @@ def _prepare_run(config: ExperimentConfig, hyper: PPOHyperParameters) -> Path:
     prefix = "seed_{}".format(config.seed)
     core_names = (
         "{}_best.pt".format(prefix),
+        "{}_stage0_best.pt".format(prefix),
+        "{}_stage1_best.pt".format(prefix),
         "{}_last.pt".format(prefix),
         "{}_config.json".format(prefix),
         "{}_train_metrics.csv".format(prefix),
@@ -125,17 +167,20 @@ def _prepare_run(config: ExperimentConfig, hyper: PPOHyperParameters) -> Path:
 def collect_rollout(env, model, state, count, device, episode_return, episode_length):
     """Store final next_state before reset; this preserves truncation bootstrap."""
 
-    names = ("states", "next_states", "raw_actions", "old_log_probs", "rewards", "terminateds", "truncateds")
+    names = ("states", "next_states", "raw_actions", "action_masks", "old_log_probs", "rewards", "terminateds", "truncateds")
     data: Dict[str, List[object]] = {name: [] for name in names}
     completed: List[Dict[str, float]] = []
     for index in range(count):
         tensor = torch.as_tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+        action_mask = env.action_mask()
+        mask_tensor = torch.as_tensor(action_mask, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
-            action, raw_action, log_prob, _, _ = model.sample_action(tensor)
+            action, raw_action, log_prob, _, _ = model.sample_action(tensor, mask_tensor)
         next_state, reward, terminated, truncated, _ = env.step(action.squeeze(0).cpu().numpy())
         data["states"].append(np.asarray(state, dtype=np.float32))
         data["next_states"].append(np.asarray(next_state, dtype=np.float32))
         data["raw_actions"].append(raw_action.squeeze(0).cpu().numpy())
+        data["action_masks"].append(action_mask)
         data["old_log_probs"].append(float(log_prob.item()))
         data["rewards"].append(float(reward))
         data["terminateds"].append(float(terminated))
@@ -181,8 +226,11 @@ def update(model, optimizer, rollout, returns, advantages, hyper: PPOHyperParame
         indices = torch.randperm(len(returns), device=returns.device)
         for start in range(0, len(returns), hyper.minibatch_size):
             batch = indices[start : start + hyper.minibatch_size]
-            new_log_probs, entropy, values = model.evaluate_actions(rollout["states"][batch], rollout["raw_actions"][batch])
-            ratio = torch.exp(new_log_probs - rollout["old_log_probs"][batch])
+            new_log_probs, entropy, values = model.evaluate_actions(
+                rollout["states"][batch], rollout["raw_actions"][batch], rollout["action_masks"][batch]
+            )
+            log_ratio = new_log_probs - rollout["old_log_probs"][batch]
+            ratio = torch.exp(torch.clamp(log_ratio, -20.0, 20.0))
             surrogate = torch.minimum(
                 ratio * advantages[batch],
                 torch.clamp(ratio, 1.0 - hyper.clip_coef, 1.0 + hyper.clip_coef) * advantages[batch],
@@ -194,6 +242,7 @@ def update(model, optimizer, rollout, returns, advantages, hyper: PPOHyperParame
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), hyper.max_grad_norm)
             optimizer.step()
+            model.clamp_log_std()
             policy_losses.append(float(policy_loss.item()))
             value_losses.append(float(value_loss.item()))
             entropies.append(float(entropy.mean().item()))
@@ -217,15 +266,43 @@ def evaluate(config: ExperimentConfig, model: ActorCritic, device: torch.device)
         model.train()
 
 
-def _save(path: Path, model: ActorCritic, optimizer: optim.Optimizer, steps: int, best_success: float) -> None:
-    torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "steps": steps, "best_success": best_success}, path)
+def _save(
+    path: Path,
+    model: ActorCritic,
+    optimizer: optim.Optimizer,
+    steps: int,
+    best_success: float,
+    best_min_net_distance: float,
+    best_return: float,
+    config: ExperimentConfig,
+) -> None:
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "steps": steps,
+            "best_success": best_success,
+            "best_min_net_distance": best_min_net_distance,
+            "best_return": best_return,
+            "launch_curriculum_stage": config.launch_curriculum_stage,
+            "curriculum_success_streak": config.curriculum_success_streak,
+        },
+        path,
+    )
 
 
-def load_last(path: Path, model: ActorCritic, optimizer: optim.Optimizer, device: torch.device):
+def load_last(path: Path, model: ActorCritic, optimizer: optim.Optimizer, device: torch.device, config: ExperimentConfig):
     checkpoint = torch.load(path, map_location=device)
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
-    return int(checkpoint["steps"]), float(checkpoint.get("best_success", -float("inf")))
+    config.launch_curriculum_stage = int(checkpoint.get("launch_curriculum_stage", 0))
+    config.curriculum_success_streak = int(checkpoint.get("curriculum_success_streak", 0))
+    return (
+        int(checkpoint["steps"]),
+        float(checkpoint.get("best_success", -float("inf"))),
+        float(checkpoint.get("best_min_net_distance", float("inf"))),
+        float(checkpoint.get("best_return", -float("inf"))),
+    )
 
 
 def train(config: ExperimentConfig) -> ActorCritic:
@@ -235,16 +312,29 @@ def train(config: ExperimentConfig) -> ActorCritic:
     run_dir = _prepare_run(config, hyper)
     prefix = "seed_{}".format(config.seed)
     env = InterceptionEnv(config)
-    model = ActorCritic(env.observation_space.shape[0], env.action_space.shape[0], hyper.hidden_dim).to(device)
+    model = ActorCritic(
+        env.observation_space.shape[0],
+        env.action_space.shape[0],
+        hyper.hidden_dim,
+        hyper.min_log_std,
+        hyper.max_log_std,
+    ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=hyper.learning_rate)
     total_steps, episode_return, episode_length = 0, 0.0, 0
     best_success = -float("inf")
+    best_min_net_distance = float("inf")
+    best_return = -float("inf")
     if config.resume:
-        total_steps, best_success = load_last(
-            run_dir / "{}_last.pt".format(prefix), model, optimizer, device
+        total_steps, best_success, best_min_net_distance, best_return = load_last(
+            run_dir / "{}_last.pt".format(prefix), model, optimizer, device, config
         )
-        training_end_step = total_steps + config.additional_train_steps
-        print("resumed ppo {} at step {}; training to {}".format(config.mode, total_steps, training_end_step))
+        training_end_step = (
+            total_steps + config.additional_train_steps
+            if config.additional_train_steps > 0
+            else None
+        )
+        destination = training_end_step if training_end_step is not None else "manual stop"
+        print("resumed ppo {} at step {}; training to {}".format(config.mode, total_steps, destination))
     else:
         training_end_step = config.total_train_steps
     next_evaluation = (total_steps // config.eval_interval_steps + 1) * config.eval_interval_steps
@@ -252,8 +342,10 @@ def train(config: ExperimentConfig) -> ActorCritic:
     state, _ = env.reset(seed=config.seed + total_steps)
     metrics = {"policy_loss": float("nan"), "value_loss": float("nan"), "entropy": float("nan")}
     try:
-        while total_steps < training_end_step:
-            count = min(hyper.rollout_steps, training_end_step - total_steps, max(1, next_evaluation - total_steps))
+        while training_end_step is None or total_steps < training_end_step:
+            count = min(hyper.rollout_steps, max(1, next_evaluation - total_steps))
+            if training_end_step is not None:
+                count = min(count, training_end_step - total_steps)
             rollout, state, episode_return, episode_length, completed = collect_rollout(env, model, state, count, device, episode_return, episode_length)
             returns, advantages = returns_and_advantages(model, rollout, hyper)
             metrics = update(model, optimizer, rollout, returns, advantages, hyper)
@@ -264,26 +356,71 @@ def train(config: ExperimentConfig) -> ActorCritic:
                     "episode_return": episode["episode_return"], "episode_length": episode["episode_length"],
                     "policy_loss": metrics["policy_loss"], "value_loss": metrics["value_loss"],
                 })
-            if total_steps >= next_evaluation or total_steps == training_end_step:
+            if total_steps >= next_evaluation or (
+                training_end_step is not None and total_steps == training_end_step
+            ):
                 result = evaluate(config, model, device)
                 append_csv_row(
                     run_dir / "{}_eval_metrics.csv".format(prefix),
                     EVAL_METRIC_FIELDS,
                     {"total_steps": total_steps, **result},
                 )
-                print("steps={} success={:.1%} return={:.2f} ppo={:.3f}/{:.3f}".format(
-                    total_steps, result["success_rate"], result["mean_return"], metrics["policy_loss"], metrics["value_loss"]
+                print("steps={} stage={} success={:.1%} rule/RL aim={:.1%}/{:.1%} return={:.2f} ppo={:.3f}/{:.3f}".format(
+                    total_steps, config.launch_curriculum_name, result["success_rate"],
+                    result["rule_aim_rate"], result["rl_aim_rate"],
+                    result["mean_return"], metrics["policy_loss"], metrics["value_loss"]
                 ))
-                if result["success_rate"] > best_success:
+                result_min_net = result["mean_min_net_distance"]
+                finite_min_net = result_min_net if np.isfinite(result_min_net) else float("inf")
+                better = (
+                    result["success_rate"] > best_success
+                    or (
+                        result["success_rate"] == best_success
+                        and finite_min_net < best_min_net_distance
+                    )
+                    or (
+                        result["success_rate"] == best_success
+                        and finite_min_net == best_min_net_distance
+                        and result["mean_return"] > best_return
+                    )
+                )
+                if better:
                     best_success = result["success_rate"]
-                    _save(run_dir / "{}_best.pt".format(prefix), model, optimizer, total_steps, best_success)
+                    best_min_net_distance = finite_min_net
+                    best_return = result["mean_return"]
+                    _save(
+                        run_dir / "{}_best.pt".format(prefix), model, optimizer, total_steps,
+                        best_success, best_min_net_distance, best_return, config,
+                    )
+                    _save(
+                        run_dir / "{}_stage{}_best.pt".format(prefix, config.launch_curriculum_stage),
+                        model, optimizer, total_steps,
+                        best_success, best_min_net_distance, best_return, config,
+                    )
+                if config.update_launch_curriculum(result["success_rate"]):
+                    print("aim curriculum advanced to {}".format(config.launch_curriculum_name))
+                    best_success = -float("inf")
+                    best_min_net_distance = float("inf")
+                    best_return = -float("inf")
+                    state, _ = env.reset()
+                    episode_return, episode_length = 0.0, 0
+                    _save(
+                        run_dir / "{}_last.pt".format(prefix), model, optimizer, total_steps,
+                        best_success, best_min_net_distance, best_return, config,
+                    )
                 while next_evaluation <= total_steps:
                     next_evaluation += config.eval_interval_steps
             if total_steps >= next_save:
-                _save(run_dir / "{}_last.pt".format(prefix), model, optimizer, total_steps, best_success)
+                _save(
+                    run_dir / "{}_last.pt".format(prefix), model, optimizer, total_steps,
+                    best_success, best_min_net_distance, best_return, config,
+                )
                 while next_save <= total_steps:
                     next_save += config.save_interval_steps
     finally:
-        _save(run_dir / "{}_last.pt".format(prefix), model, optimizer, total_steps, best_success)
+        _save(
+            run_dir / "{}_last.pt".format(prefix), model, optimizer, total_steps,
+            best_success, best_min_net_distance, best_return, config,
+        )
         env.close()
     return model

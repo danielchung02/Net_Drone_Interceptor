@@ -10,7 +10,8 @@ class ExperimentConfig:
         self.mode = "pn"
         self.seed = 0
         self.device = "auto"
-        self.total_train_steps = 3_000_000
+        # None means that training continues until the process is interrupted.
+        self.total_train_steps = None
         self.eval_interval_steps = 100_000
         self.save_interval_steps = 100_000
         self.n_eval_episodes = 20
@@ -24,7 +25,7 @@ class ExperimentConfig:
         self.rotorpy_vehicle = "crazyflie"
         self.rotorpy_aero = True
         self.control_dt = 0.05 #RL 정책이 action을 새로 내는 주기
-        self.physics_dt = 0.01 #RotorPy가 물리 상태를 적분하는 주기
+        self.physics_dt = self.control_dt / 3.0 #한 action마다 RotorPy physics substep 3회
         self.debug_max_steps = 0
 
         # Empty spherical engagement volume.
@@ -62,14 +63,30 @@ class ExperimentConfig:
         self.net_speed = 45.0 
         self.net_capture_radius = 2.0
 
+        # Aim curriculum. PN starts at stage 1; E2E starts at stage 0.
+        # 0: rule-based ballistic aim while E2E learns guidance.
+        # 1: RL directly chooses LOS-relative launch angles.
+        self.launch_curriculum_stage = 0
+        self.curriculum_success_threshold = 0.80
+        self.curriculum_required_evaluations = 2
+        self.curriculum_success_streak = 0
+        self.fixed_auto_launch_distance = 15.0
+        self.launch_gate_min_closing_speed = 5.0
+        self.launch_azimuth_limit = 0.5235987755982988  # 30 degrees
+        self.launch_elevation_limit = 0.3490658503988659  # 20 degrees
+
         # Identical capture-focused reward for PN and end-to-end agents.
         self.terminal_reward = 10.0
         self.capture_time_bonus = 5.0
         self.time_penalty_scale = 2.5
+        # Signed distance progress: moving away gives the opposite reward, so
+        # hovering/following at a fixed distance cannot accumulate reward.
+        self.approach_progress_scale = 5.0
         self.miss_penalty = 12.0
         self.passive_exit_penalty = 15.0
+        self.interceptor_exit_penalty = 25.0
         self.near_miss_bonus = 4.0
-        self.near_miss_distance = 10.0
+        self.near_miss_distance = 40.0
         self.reference_time = 25.0 #2R/vt = 2*100/8 = 25
         self.run_root = "runs" 
 
@@ -84,6 +101,10 @@ class ExperimentConfig:
             raise ValueError("physics_dt must divide control_dt exactly")
         if self.n_eval_episodes > len(self.eval_seed_bank):
             raise ValueError("evaluation seed bank is shorter than n_eval_episodes")
+        if self.total_train_steps is not None and self.total_train_steps <= 0:
+            raise ValueError("total_train_steps must be positive or None")
+        if self.launch_curriculum_stage not in {0, 1}:
+            raise ValueError("launch_curriculum_stage must be 0 or 1")
         for name in (
             "target_sine_horizontal_amplitude_range",
             "target_sine_vertical_amplitude_range",
@@ -93,6 +114,26 @@ class ExperimentConfig:
             lower, upper = getattr(self, name)
             if lower <= 0.0 or lower >= upper:
                 raise ValueError("{} must satisfy 0 < minimum < maximum".format(name))
+
+    @property
+    def launch_curriculum_name(self) -> str:
+        return ("guidance_with_rule_aim", "rl_los_aim")[self.launch_curriculum_stage]
+
+    def update_launch_curriculum(self, success_rate: float) -> bool:
+        """Advance only after repeated held-out success, never from a step count."""
+
+        if self.launch_curriculum_stage >= 1:
+            return False
+        qualifies = success_rate >= self.curriculum_success_threshold
+        if qualifies:
+            self.curriculum_success_streak += 1
+        else:
+            self.curriculum_success_streak = 0
+        if self.curriculum_success_streak < self.curriculum_required_evaluations:
+            return False
+        self.launch_curriculum_stage += 1
+        self.curriculum_success_streak = 0
+        return True
 
     def load_dict(self, values: Dict[str, object]) -> None:
         """Restore the fields understood by the current configuration."""
@@ -108,10 +149,11 @@ class ExperimentConfig:
     @property
     def action_dim(self) -> int:
         if self.mode == "pn":
-            # [net azimuth, net elevation, immediate fire trigger]
-            return 3
-        # [interceptor ax, ay, az, net azimuth, net elevation, immediate fire trigger]
-        return 6
+            # [LOS-relative horizontal launch angle, vertical launch angle]
+            return 2
+        # [LOS acceleration, horizontal acceleration, vertical acceleration,
+        #  LOS-relative horizontal launch angle, vertical launch angle]
+        return 5
 
     @property
     def physics_substeps(self) -> int:

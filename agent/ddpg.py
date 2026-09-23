@@ -22,6 +22,28 @@ from config import ExperimentConfig
 from interception_env import InterceptionEnv
 
 
+def mask_inactive_aim(states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    masks = torch.ones_like(actions)
+    gate_open = states[..., -2] > 0.5
+    if actions.shape[-1] == 2:
+        masks[...] = gate_open.unsqueeze(-1).to(actions.dtype)
+    else:
+        rl_aim_stage = states[..., -1] > 0.5
+        aim_active = (gate_open & rl_aim_stage).unsqueeze(-1).to(actions.dtype)
+        masks[..., 3:5] = aim_active
+    return actions * masks
+
+
+def mask_inactive_aim_numpy(state: np.ndarray, action: np.ndarray) -> np.ndarray:
+    action = np.asarray(action, dtype=np.float32).copy()
+    if action.shape[-1] == 2:
+        if state[-2] <= 0.5:
+            action[:] = 0.0
+    elif state[-1] <= 0.5 or state[-2] <= 0.5:
+        action[3:5] = 0.0
+    return action
+
+
 class AgentHyperParameters:
     """DDPG choices, separate from the shared physical experiment settings."""
 
@@ -101,7 +123,8 @@ class DDPGAgent:
                 self.hyperparameters.exploration_noise_std,
                 size=action.shape,
             ).astype(np.float32)
-        return np.clip(action, -1.0, 1.0).astype(np.float32)
+        action = np.clip(action, -1.0, 1.0).astype(np.float32)
+        return mask_inactive_aim_numpy(state, action)
 
     @torch.no_grad()
     def soft_update(self, online_network: nn.Module, target_network: nn.Module) -> None:
@@ -117,7 +140,7 @@ class DDPGAgent:
         terminateds = batch["terminateds"]
 
         with torch.no_grad():
-            target_actions = self.target_actor(next_states)
+            target_actions = mask_inactive_aim(next_states, self.target_actor(next_states))
             target_qvalues = self.target_critic(next_states, target_actions)
             # Do not use ``terminated or truncated`` here.  A timeout is a
             # time-limit cut and must bootstrap from replay's stored next_state.
@@ -132,7 +155,8 @@ class DDPGAgent:
 
         for parameter in self.critic.parameters():
             parameter.requires_grad_(False)
-        actor_loss = -self.critic(states, self.actor(states)).mean()
+        actor_actions = mask_inactive_aim(states, self.actor(states))
+        actor_loss = -self.critic(states, actor_actions).mean()
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         actor_grad_norm = float(torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.hyperparameters.max_grad_norm))
@@ -164,6 +188,9 @@ def save_checkpoint(
     agent: DDPGAgent,
     total_steps: int,
     best_success: float,
+    best_min_net_distance: float,
+    best_return: float,
+    config: ExperimentConfig,
     checkpoint_path: Path,
     replay_buffer=None,
 ) -> None:
@@ -176,6 +203,10 @@ def save_checkpoint(
         "critic_optimizer_state_dict": agent.critic_optimizer.state_dict(),
         "total_steps": total_steps,
         "best_success": best_success,
+        "best_min_net_distance": best_min_net_distance,
+        "best_return": best_return,
+        "launch_curriculum_stage": config.launch_curriculum_stage,
+        "curriculum_success_streak": config.curriculum_success_streak,
     }
     if replay_buffer is not None:
         checkpoint["replay_buffer"] = replay_buffer.state_dict()
@@ -200,6 +231,8 @@ def prepare_run(config: ExperimentConfig, hyperparameters: AgentHyperParameters)
     prefix = "seed_{}".format(config.seed)
     core_names = (
         "{}_best.pt".format(prefix),
+        "{}_stage0_best.pt".format(prefix),
+        "{}_stage1_best.pt".format(prefix),
         "{}_last.pt".format(prefix),
         "{}_config.json".format(prefix),
         "{}_train_metrics.csv".format(prefix),
@@ -249,6 +282,8 @@ def train(config: ExperimentConfig):
     eval_log_path = output_dir / "{}_eval_metrics.csv".format(prefix)
     starting_steps = 0
     best_success = -float("inf")
+    best_min_net_distance = float("inf")
+    best_return = -float("inf")
     if config.resume:
         checkpoint = load_checkpoint(
             agent,
@@ -258,8 +293,13 @@ def train(config: ExperimentConfig):
         )
         starting_steps = int(checkpoint["total_steps"])
         best_success = float(checkpoint.get("best_success", -float("inf")))
-        training_end_step = starting_steps + config.additional_train_steps
-        print("resumed ddpg {} at step {}; training to {}".format(config.mode, starting_steps, training_end_step))
+        best_min_net_distance = float(checkpoint.get("best_min_net_distance", float("inf")))
+        best_return = float(checkpoint.get("best_return", -float("inf")))
+        config.launch_curriculum_stage = int(checkpoint.get("launch_curriculum_stage", 0))
+        config.curriculum_success_streak = int(checkpoint.get("curriculum_success_streak", 0))
+        training_end_step = starting_steps + config.additional_train_steps if config.additional_train_steps > 0 else None
+        destination = training_end_step if training_end_step is not None else "manual stop"
+        print("resumed ddpg {} at step {}; training to {}".format(config.mode, starting_steps, destination))
     else:
         training_end_step = config.total_train_steps
     metrics = {
@@ -276,11 +316,13 @@ def train(config: ExperimentConfig):
 
     try:
         total_steps = starting_steps
-        for total_steps in range(starting_steps + 1, training_end_step + 1):
+        while training_end_step is None or total_steps < training_end_step:
+            total_steps += 1
             if total_steps <= hyperparameters.start_steps:
                 action = env.action_space.sample()
             else:
                 action = agent.select_action(state, add_noise=True)
+            action = mask_inactive_aim_numpy(state, action)
 
             # Store this next_state first.  If the transition is truncated,
             # replay must retain it for Bellman bootstrap before calling reset.
@@ -311,15 +353,20 @@ def train(config: ExperimentConfig):
                 for _ in range(hyperparameters.updates_per_step):
                     metrics = agent.update_ddpg(replay_buffer)
 
-            if total_steps % config.eval_interval_steps == 0 or total_steps == training_end_step:
+            if total_steps % config.eval_interval_steps == 0 or (
+                training_end_step is not None and total_steps == training_end_step
+            ):
                 evaluation = evaluate(eval_env, agent, config)
                 evaluation["total_steps"] = total_steps
                 append_csv_row(eval_log_path, EVAL_METRIC_FIELDS, evaluation)
                 print(
-                    "steps: {} | success: {:.1%} | return: {:.2f} | "
+                    "steps: {} | stage: {} | success: {:.1%} | rule/RL aim: {:.1%}/{:.1%} | return: {:.2f} | "
                     "actor/critic: {:.3f}/{:.3f} | Q/target: {:.2f}/{:.2f}".format(
                         total_steps,
+                        config.launch_curriculum_name,
                         evaluation["success_rate"],
+                        evaluation["rule_aim_rate"],
+                        evaluation["rl_aim_rate"],
                         evaluation["mean_return"],
                         metrics["actor_loss"],
                         metrics["critic_loss"],
@@ -327,14 +374,53 @@ def train(config: ExperimentConfig):
                         metrics["target_q_mean"],
                     )
                 )
-                if evaluation["success_rate"] > best_success:
+                evaluation_min_net = evaluation["mean_min_net_distance"]
+                finite_min_net = evaluation_min_net if np.isfinite(evaluation_min_net) else float("inf")
+                better = (
+                    evaluation["success_rate"] > best_success
+                    or (evaluation["success_rate"] == best_success and finite_min_net < best_min_net_distance)
+                    or (
+                        evaluation["success_rate"] == best_success
+                        and finite_min_net == best_min_net_distance
+                        and evaluation["mean_return"] > best_return
+                    )
+                )
+                if better:
                     best_success = evaluation["success_rate"]
-                    save_checkpoint(agent, total_steps, best_success, output_dir / "{}_best.pt".format(prefix))
+                    best_min_net_distance = finite_min_net
+                    best_return = evaluation["mean_return"]
+                    save_checkpoint(
+                        agent, total_steps, best_success, best_min_net_distance,
+                        best_return, config, output_dir / "{}_best.pt".format(prefix),
+                    )
+                    save_checkpoint(
+                        agent, total_steps, best_success, best_min_net_distance,
+                        best_return, config,
+                        output_dir / "{}_stage{}_best.pt".format(prefix, config.launch_curriculum_stage),
+                    )
+                if config.update_launch_curriculum(evaluation["success_rate"]):
+                    print("aim curriculum advanced to {}".format(config.launch_curriculum_name))
+                    best_success = -float("inf")
+                    best_min_net_distance = float("inf")
+                    best_return = -float("inf")
+                    replay_buffer = ReplayBuffer(observation_dim, action_dim, hyperparameters.replay_capacity)
+                    state, _ = env.reset()
+                    episode_return, episode_length = 0.0, 0
+                    save_checkpoint(
+                        agent, total_steps, best_success, best_min_net_distance,
+                        best_return, config, output_dir / "{}_last.pt".format(prefix), replay_buffer,
+                    )
 
             if total_steps % config.save_interval_steps == 0:
-                save_checkpoint(agent, total_steps, best_success, output_dir / "{}_last.pt".format(prefix), replay_buffer)
+                save_checkpoint(
+                    agent, total_steps, best_success, best_min_net_distance,
+                    best_return, config, output_dir / "{}_last.pt".format(prefix), replay_buffer,
+                )
     finally:
-        save_checkpoint(agent, total_steps, best_success, output_dir / "{}_last.pt".format(prefix), replay_buffer)
+        save_checkpoint(
+            agent, total_steps, best_success, best_min_net_distance,
+            best_return, config, output_dir / "{}_last.pt".format(prefix), replay_buffer,
+        )
         env.close()
         eval_env.close()
 

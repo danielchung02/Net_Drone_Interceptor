@@ -23,6 +23,28 @@ from config import ExperimentConfig
 from interception_env import InterceptionEnv
 
 
+def active_action_masks(states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    masks = torch.ones_like(actions)
+    gate_open = states[..., -2] > 0.5
+    if actions.shape[-1] == 2:
+        masks[...] = gate_open.unsqueeze(-1).to(actions.dtype)
+    else:
+        rl_aim_stage = states[..., -1] > 0.5
+        aim_active = (gate_open & rl_aim_stage).unsqueeze(-1).to(actions.dtype)
+        masks[..., 3:5] = aim_active
+    return masks
+
+
+def mask_inactive_aim_numpy(state: np.ndarray, action: np.ndarray) -> np.ndarray:
+    action = np.asarray(action, dtype=np.float32).copy()
+    if action.shape[-1] == 2:
+        if state[-2] <= 0.5:
+            action[:] = 0.0
+    elif state[-1] <= 0.5 or state[-2] <= 0.5:
+        action[3:5] = 0.0
+    return action
+
+
 class AgentHyperParameters:
     """SAC choices, including the entropy-temperature mechanism."""
 
@@ -70,7 +92,7 @@ class GaussianActor(nn.Module):
         raw_action = distribution.rsample()
         action = torch.tanh(raw_action)
         log_probability = distribution.log_prob(raw_action) - torch.log(1.0 - action.pow(2) + 1e-6)
-        return action, log_probability.sum(dim=-1)
+        return action, log_probability
 
     def deterministic_action(self, states: torch.Tensor) -> torch.Tensor:
         mean, _ = self.forward(states)
@@ -114,7 +136,6 @@ class SACAgent:
         self.target_critic = copy.deepcopy(self.critic).to(device)
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=hyperparameters.actor_learning_rate)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=hyperparameters.critic_learning_rate)
-        self.target_entropy = -float(action_dim)
         if hyperparameters.auto_entropy_tuning:
             self.log_alpha = torch.tensor(
                 np.log(hyperparameters.alpha),
@@ -142,7 +163,8 @@ class SACAgent:
                 action = self.actor.deterministic_action(state_tensor)
             else:
                 action, _ = self.actor.sample_action(state_tensor)
-        return action.squeeze(0).cpu().numpy().astype(np.float32)
+        action = action.squeeze(0).cpu().numpy().astype(np.float32)
+        return mask_inactive_aim_numpy(state, action)
 
     @torch.no_grad()
     def soft_update(self) -> None:
@@ -158,7 +180,10 @@ class SACAgent:
         terminateds = batch["terminateds"]
 
         with torch.no_grad():
-            next_actions, next_log_probabilities = self.actor.sample_action(next_states)
+            next_actions, next_log_probability_per_dimension = self.actor.sample_action(next_states)
+            next_action_masks = active_action_masks(next_states, next_actions)
+            next_actions = next_actions * next_action_masks
+            next_log_probabilities = (next_log_probability_per_dimension * next_action_masks).sum(dim=-1)
             target_q1, target_q2 = self.target_critic(next_states, next_actions)
             target_qvalues = torch.minimum(target_q1, target_q2) - self.alpha.detach() * next_log_probabilities
             # Only physical/MDP terminal events disable the bootstrap.  A
@@ -174,7 +199,10 @@ class SACAgent:
 
         for parameter in self.critic.parameters():
             parameter.requires_grad_(False)
-        sampled_actions, log_probabilities = self.actor.sample_action(states)
+        sampled_actions, log_probability_per_dimension = self.actor.sample_action(states)
+        action_masks = active_action_masks(states, sampled_actions)
+        sampled_actions = sampled_actions * action_masks
+        log_probabilities = (log_probability_per_dimension * action_masks).sum(dim=-1)
         q1_pi, q2_pi = self.critic(states, sampled_actions)
         actor_loss = (self.alpha.detach() * log_probabilities - torch.minimum(q1_pi, q2_pi)).mean()
         self.actor_optimizer.zero_grad()
@@ -186,8 +214,9 @@ class SACAgent:
 
         alpha_loss = float("nan")
         if self.log_alpha is not None and self.alpha_optimizer is not None:
+            target_entropy = -action_masks.sum(dim=-1)
             alpha_loss_tensor = -(
-                self.log_alpha * (log_probabilities + self.target_entropy).detach()
+                self.log_alpha * (log_probabilities + target_entropy).detach()
             ).mean()
             self.alpha_optimizer.zero_grad()
             alpha_loss_tensor.backward()
@@ -215,7 +244,16 @@ def evaluate(env, agent: SACAgent, config: ExperimentConfig) -> Dict[str, float]
         agent.actor.train()
 
 
-def save_checkpoint(agent: SACAgent, total_steps: int, best_success: float, checkpoint_path: Path, replay_buffer=None) -> None:
+def save_checkpoint(
+    agent: SACAgent,
+    total_steps: int,
+    best_success: float,
+    best_min_net_distance: float,
+    best_return: float,
+    config: ExperimentConfig,
+    checkpoint_path: Path,
+    replay_buffer=None,
+) -> None:
     checkpoint = {
         "actor_state_dict": agent.actor.state_dict(),
         "critic_state_dict": agent.critic.state_dict(),
@@ -224,6 +262,10 @@ def save_checkpoint(agent: SACAgent, total_steps: int, best_success: float, chec
         "critic_optimizer_state_dict": agent.critic_optimizer.state_dict(),
         "total_steps": total_steps,
         "best_success": best_success,
+        "best_min_net_distance": best_min_net_distance,
+        "best_return": best_return,
+        "launch_curriculum_stage": config.launch_curriculum_stage,
+        "curriculum_success_streak": config.curriculum_success_streak,
     }
     if agent.log_alpha is not None and agent.alpha_optimizer is not None:
         checkpoint["log_alpha"] = agent.log_alpha.detach().cpu()
@@ -254,6 +296,8 @@ def prepare_run(config: ExperimentConfig, hyperparameters: AgentHyperParameters)
     prefix = "seed_{}".format(config.seed)
     core_names = (
         "{}_best.pt".format(prefix),
+        "{}_stage0_best.pt".format(prefix),
+        "{}_stage1_best.pt".format(prefix),
         "{}_last.pt".format(prefix),
         "{}_config.json".format(prefix),
         "{}_train_metrics.csv".format(prefix),
@@ -303,6 +347,8 @@ def train(config: ExperimentConfig):
     eval_log_path = output_dir / "{}_eval_metrics.csv".format(prefix)
     starting_steps = 0
     best_success = -float("inf")
+    best_min_net_distance = float("inf")
+    best_return = -float("inf")
     if config.resume:
         checkpoint = load_checkpoint(
             agent,
@@ -312,8 +358,13 @@ def train(config: ExperimentConfig):
         )
         starting_steps = int(checkpoint["total_steps"])
         best_success = float(checkpoint.get("best_success", -float("inf")))
-        training_end_step = starting_steps + config.additional_train_steps
-        print("resumed sac {} at step {}; training to {}".format(config.mode, starting_steps, training_end_step))
+        best_min_net_distance = float(checkpoint.get("best_min_net_distance", float("inf")))
+        best_return = float(checkpoint.get("best_return", -float("inf")))
+        config.launch_curriculum_stage = int(checkpoint.get("launch_curriculum_stage", 0))
+        config.curriculum_success_streak = int(checkpoint.get("curriculum_success_streak", 0))
+        training_end_step = starting_steps + config.additional_train_steps if config.additional_train_steps > 0 else None
+        destination = training_end_step if training_end_step is not None else "manual stop"
+        print("resumed sac {} at step {}; training to {}".format(config.mode, starting_steps, destination))
     else:
         training_end_step = config.total_train_steps
     metrics = {
@@ -330,11 +381,13 @@ def train(config: ExperimentConfig):
 
     try:
         total_steps = starting_steps
-        for total_steps in range(starting_steps + 1, training_end_step + 1):
+        while training_end_step is None or total_steps < training_end_step:
+            total_steps += 1
             if total_steps <= hyperparameters.start_steps:
                 action = env.action_space.sample()
             else:
                 action = agent.select_action(state, deterministic=False)
+            action = mask_inactive_aim_numpy(state, action)
 
             next_state, reward, terminated, truncated, _ = env.step(action)
             replay_buffer.add(state, action, reward, next_state, terminated, truncated)
@@ -363,29 +416,73 @@ def train(config: ExperimentConfig):
                 for _ in range(hyperparameters.updates_per_step):
                     metrics = agent.update_sac(replay_buffer)
 
-            if total_steps % config.eval_interval_steps == 0 or total_steps == training_end_step:
+            if total_steps % config.eval_interval_steps == 0 or (
+                training_end_step is not None and total_steps == training_end_step
+            ):
                 evaluation = evaluate(eval_env, agent, config)
                 evaluation["total_steps"] = total_steps
                 append_csv_row(eval_log_path, EVAL_METRIC_FIELDS, evaluation)
                 print(
-                    "steps: {} | success: {:.1%} | return: {:.2f} | "
+                    "steps: {} | stage: {} | success: {:.1%} | rule/RL aim: {:.1%}/{:.1%} | return: {:.2f} | "
                     "actor/critic: {:.3f}/{:.3f} | alpha: {:.3f}".format(
                         total_steps,
+                        config.launch_curriculum_name,
                         evaluation["success_rate"],
+                        evaluation["rule_aim_rate"],
+                        evaluation["rl_aim_rate"],
                         evaluation["mean_return"],
                         metrics["actor_loss"],
                         metrics["critic_loss"],
                         metrics["alpha"],
                     )
                 )
-                if evaluation["success_rate"] > best_success:
+                evaluation_min_net = evaluation["mean_min_net_distance"]
+                finite_min_net = evaluation_min_net if np.isfinite(evaluation_min_net) else float("inf")
+                better = (
+                    evaluation["success_rate"] > best_success
+                    or (evaluation["success_rate"] == best_success and finite_min_net < best_min_net_distance)
+                    or (
+                        evaluation["success_rate"] == best_success
+                        and finite_min_net == best_min_net_distance
+                        and evaluation["mean_return"] > best_return
+                    )
+                )
+                if better:
                     best_success = evaluation["success_rate"]
-                    save_checkpoint(agent, total_steps, best_success, output_dir / "{}_best.pt".format(prefix))
+                    best_min_net_distance = finite_min_net
+                    best_return = evaluation["mean_return"]
+                    save_checkpoint(
+                        agent, total_steps, best_success, best_min_net_distance,
+                        best_return, config, output_dir / "{}_best.pt".format(prefix),
+                    )
+                    save_checkpoint(
+                        agent, total_steps, best_success, best_min_net_distance,
+                        best_return, config,
+                        output_dir / "{}_stage{}_best.pt".format(prefix, config.launch_curriculum_stage),
+                    )
+                if config.update_launch_curriculum(evaluation["success_rate"]):
+                    print("aim curriculum advanced to {}".format(config.launch_curriculum_name))
+                    best_success = -float("inf")
+                    best_min_net_distance = float("inf")
+                    best_return = -float("inf")
+                    replay_buffer = ReplayBuffer(observation_dim, action_dim, hyperparameters.replay_capacity)
+                    state, _ = env.reset()
+                    episode_return, episode_length = 0.0, 0
+                    save_checkpoint(
+                        agent, total_steps, best_success, best_min_net_distance,
+                        best_return, config, output_dir / "{}_last.pt".format(prefix), replay_buffer,
+                    )
 
             if total_steps % config.save_interval_steps == 0:
-                save_checkpoint(agent, total_steps, best_success, output_dir / "{}_last.pt".format(prefix), replay_buffer)
+                save_checkpoint(
+                    agent, total_steps, best_success, best_min_net_distance,
+                    best_return, config, output_dir / "{}_last.pt".format(prefix), replay_buffer,
+                )
     finally:
-        save_checkpoint(agent, total_steps, best_success, output_dir / "{}_last.pt".format(prefix), replay_buffer)
+        save_checkpoint(
+            agent, total_steps, best_success, best_min_net_distance,
+            best_return, config, output_dir / "{}_last.pt".format(prefix), replay_buffer,
+        )
         env.close()
         eval_env.close()
 
