@@ -35,6 +35,11 @@ class AgentHyperParameters:
         self.min_log_std = -5.0
         self.max_log_std = 1.0
         self.max_grad_norm = 0.5
+        self.imitation_learning_rate = 1e-3
+        self.imitation_epochs = 20
+        self.imitation_minibatch_size = 128
+        self.imitation_buffer_size = 2_048
+        self.joint_finetune_learning_rate = 1e-4
 
     def to_dict(self) -> Dict[str, object]:
         return self.__dict__.copy()
@@ -49,7 +54,8 @@ def squashed_log_prob(distribution: Normal, raw_action: torch.Tensor) -> torch.T
 
 def sample_squashed_normal(mean: torch.Tensor, log_std: torch.Tensor, action_masks: torch.Tensor):
     distribution = Normal(mean, torch.exp(log_std))
-    raw_action = distribution.rsample()
+    sampled_raw_action = distribution.rsample()
+    raw_action = torch.where(action_masks > 0.5, sampled_raw_action, mean)
     action = torch.tanh(raw_action)
     per_dimension = squashed_log_prob(distribution, raw_action)
     log_prob = (per_dimension * action_masks).sum(dim=-1)
@@ -97,7 +103,11 @@ class ActorCritic(nn.Module):
         self.max_log_std = max_log_std
 
     def forward(self, states: torch.Tensor):
-        mean = self.actor_mean(states)
+        actor_states = states
+        if self.log_std.shape[0] == 5:
+            actor_states = states.clone()
+            actor_states[..., -1] = 0.0
+        mean = self.actor_mean(actor_states)
         log_std = torch.clamp(self.log_std, self.min_log_std, self.max_log_std).expand_as(mean)
         values = self.critic(states).squeeze(dim=-1)
         return mean, log_std, values
@@ -119,6 +129,18 @@ class ActorCritic(nn.Module):
     def deterministic_action(self, states: torch.Tensor) -> torch.Tensor:
         mean, _, _ = self.forward(states)
         return torch.tanh(mean)
+
+    def set_guidance_frozen(self, frozen: bool) -> None:
+        if self.log_std.shape[0] != 5:
+            return
+        for layer in list(self.actor_mean.children())[:-1]:
+            for parameter in layer.parameters():
+                parameter.requires_grad_(not frozen)
+
+    def reset_critic(self) -> None:
+        for module in self.critic.modules():
+            if isinstance(module, nn.Linear):
+                module.reset_parameters()
 
 
 def collect_rollout(
@@ -144,6 +166,8 @@ def collect_rollout(
     reward_list: List[float] = []
     terminated_list: List[bool] = []
     truncated_list: List[bool] = []
+    teacher_state_list: List[np.ndarray] = []
+    teacher_aim_list: List[np.ndarray] = []
     completed_episodes: List[Dict[str, object]] = []
 
     for step_index in range(num_steps):
@@ -161,6 +185,11 @@ def collect_rollout(
         reward_list.append(float(reward))
         terminated_list.append(bool(terminated))
         truncated_list.append(bool(truncated))
+        if info["launch_source"] == "rule_aim":
+            teacher_state = np.asarray(state, dtype=np.float32).copy()
+            teacher_state[-1] = 1.0
+            teacher_state_list.append(teacher_state)
+            teacher_aim_list.append(np.asarray(info["teacher_aim_action"], dtype=np.float32))
         running_episode_return += float(reward)
         running_episode_length += 1
 
@@ -187,6 +216,8 @@ def collect_rollout(
         "rewards": torch.as_tensor(np.asarray(reward_list), dtype=torch.float32, device=device),
         "terminateds": torch.as_tensor(np.asarray(terminated_list), dtype=torch.float32, device=device),
         "truncateds": torch.as_tensor(np.asarray(truncated_list), dtype=torch.float32, device=device),
+        "teacher_states": torch.as_tensor(np.asarray(teacher_state_list), dtype=torch.float32, device=device),
+        "teacher_aims": torch.as_tensor(np.asarray(teacher_aim_list), dtype=torch.float32, device=device),
     }
     return rollout, state, running_episode_return, running_episode_length, completed_episodes
 
@@ -241,6 +272,49 @@ def compute_a2c_loss(
     return total_loss, policy_loss, value_loss, entropy
 
 
+def imitate_ballistic_aim(
+    model: ActorCritic,
+    states: np.ndarray,
+    targets: np.ndarray,
+    hyperparameters: AgentHyperParameters,
+    device: torch.device,
+) -> float:
+    if len(states) == 0:
+        return float("nan")
+    model.set_guidance_frozen(True)
+    state_tensor = torch.as_tensor(states, dtype=torch.float32, device=device)
+    target_tensor = torch.as_tensor(targets, dtype=torch.float32, device=device)
+    optimizer = optim.Adam(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=hyperparameters.imitation_learning_rate,
+    )
+    losses: List[float] = []
+    for _ in range(hyperparameters.imitation_epochs):
+        indices = torch.randperm(len(state_tensor), device=device)
+        for start in range(0, len(state_tensor), hyperparameters.imitation_minibatch_size):
+            batch = indices[start : start + hyperparameters.imitation_minibatch_size]
+            predicted = model.deterministic_action(state_tensor[batch])[:, -2:]
+            loss = F.mse_loss(predicted, target_tensor[batch])
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), hyperparameters.max_grad_norm)
+            optimizer.step()
+            losses.append(float(loss.item()))
+    return float(np.mean(losses))
+
+
+def optimizer_for_stage(model, config, hyperparameters):
+    model.set_guidance_frozen(
+        config.mode == "e2e" and config.launch_curriculum_stage == 1
+    )
+    learning_rate = (
+        hyperparameters.joint_finetune_learning_rate
+        if config.mode == "e2e" and config.launch_curriculum_stage == 2
+        else hyperparameters.learning_rate
+    )
+    return optim.Adam(model.parameters(), lr=learning_rate)
+
+
 def evaluate(env, model: ActorCritic, config: ExperimentConfig, device: torch.device) -> Dict[str, float]:
     model.eval()
 
@@ -276,6 +350,7 @@ def save_checkpoint(
             "best_return": best_return,
             "launch_curriculum_stage": config.launch_curriculum_stage,
             "curriculum_success_streak": config.curriculum_success_streak,
+            "curriculum_stage_start_step": config.curriculum_stage_start_step,
         },
         checkpoint_path,
     )
@@ -300,6 +375,7 @@ def prepare_run(config: ExperimentConfig, hyperparameters: AgentHyperParameters)
         "{}_best.pt".format(prefix),
         "{}_stage0_best.pt".format(prefix),
         "{}_stage1_best.pt".format(prefix),
+        "{}_stage2_best.pt".format(prefix),
         "{}_last.pt".format(prefix),
         "{}_config.json".format(prefix),
         "{}_train_metrics.csv".format(prefix),
@@ -349,7 +425,7 @@ def train(config: ExperimentConfig):
         hyperparameters.min_log_std,
         hyperparameters.max_log_std,
     ).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=hyperparameters.learning_rate)
+    optimizer = optimizer_for_stage(model, config, hyperparameters)
 
     train_log_path = output_dir / "{}_train_metrics.csv".format(prefix)
     eval_log_path = output_dir / "{}_eval_metrics.csv".format(prefix)
@@ -370,6 +446,12 @@ def train(config: ExperimentConfig):
         best_return = float(checkpoint.get("best_return", -float("inf")))
         config.launch_curriculum_stage = int(checkpoint.get("launch_curriculum_stage", 0))
         config.curriculum_success_streak = int(checkpoint.get("curriculum_success_streak", 0))
+        config.curriculum_stage_start_step = int(
+            checkpoint.get("curriculum_stage_start_step", total_steps)
+        )
+        model.set_guidance_frozen(
+            config.mode == "e2e" and config.launch_curriculum_stage == 1
+        )
         training_end_step = total_steps + config.additional_train_steps if config.additional_train_steps > 0 else None
         destination = training_end_step if training_end_step is not None else "manual stop"
         print("resumed a2c {} at step {}; training to {}".format(config.mode, total_steps, destination))
@@ -380,6 +462,8 @@ def train(config: ExperimentConfig):
     state, _ = env.reset(seed=seed + total_steps)
     running_episode_return = 0.0
     running_episode_length = 0
+    imitation_states: List[np.ndarray] = []
+    imitation_targets: List[np.ndarray] = []
 
     try:
         while training_end_step is None or total_steps < training_end_step:
@@ -395,6 +479,11 @@ def train(config: ExperimentConfig):
                 running_episode_return,
                 running_episode_length,
             )
+            if rollout["teacher_states"].numel() > 0:
+                imitation_states.extend(rollout["teacher_states"].cpu().numpy())
+                imitation_targets.extend(rollout["teacher_aims"].cpu().numpy())
+                imitation_states = imitation_states[-hyperparameters.imitation_buffer_size :]
+                imitation_targets = imitation_targets[-hyperparameters.imitation_buffer_size :]
             returns, advantages = compute_returns_and_advantages(
                 model,
                 rollout,
@@ -436,11 +525,12 @@ def train(config: ExperimentConfig):
                 evaluation["total_steps"] = total_steps
                 append_csv_row(eval_log_path, EVAL_METRIC_FIELDS, evaluation)
                 print(
-                    "steps: {} | stage: {} | success: {:.1%} | rule/RL aim: {:.1%}/{:.1%} | return: {:.2f} | "
+                    "steps: {} | stage: {} | success: {:.1%} | gate: {:.1%} | rule/RL aim: {:.1%}/{:.1%} | return: {:.2f} | "
                     "policy/value/entropy: {:.3f}/{:.3f}/{:.3f} | grad: {:.3g}".format(
                         total_steps,
                         config.launch_curriculum_name,
                         evaluation["success_rate"],
+                        evaluation["gate_open_rate"],
                         evaluation["rule_aim_rate"],
                         evaluation["rl_aim_rate"],
                         evaluation["mean_return"],
@@ -474,8 +564,27 @@ def train(config: ExperimentConfig):
                         best_return, config,
                         output_dir / "{}_stage{}_best.pt".format(prefix, config.launch_curriculum_stage),
                     )
-                if config.update_launch_curriculum(evaluation["success_rate"]):
-                    print("aim curriculum advanced to {}".format(config.launch_curriculum_name))
+                if config.update_launch_curriculum(
+                    total_steps,
+                    evaluation["success_rate"],
+                    evaluation["gate_open_rate"],
+                ):
+                    if config.launch_curriculum_stage == 1:
+                        imitation_loss = imitate_ballistic_aim(
+                            model,
+                            np.asarray(imitation_states, dtype=np.float32),
+                            np.asarray(imitation_targets, dtype=np.float32),
+                            hyperparameters,
+                            device,
+                        )
+                        print("ballistic aim imitation samples={} loss={:.6f}".format(
+                            len(imitation_states), imitation_loss
+                        ))
+                    model.reset_critic()
+                    optimizer = optimizer_for_stage(model, config, hyperparameters)
+                    print("aim curriculum advanced to {}; critic and optimizer reset".format(
+                        config.launch_curriculum_name
+                    ))
                     best_success = -float("inf")
                     best_min_net_distance = float("inf")
                     best_return = -float("inf")

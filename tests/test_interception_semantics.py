@@ -187,17 +187,44 @@ def test_rule_timing_launches_at_fifteen_metres_and_stops_interceptor():
         env.close()
 
 
-def test_curriculum_advances_from_repeated_evaluation_success_not_steps():
-    config = make_simple_config()
+def test_curriculum_requires_minimum_steps_gate_rate_and_five_stable_evaluations():
+    config = make_simple_config(mode="e2e")
     qualifying_success = config.curriculum_success_threshold
-    for _ in range(config.curriculum_required_evaluations - 1):
-        assert not config.update_launch_curriculum(qualifying_success)
-        assert config.launch_curriculum_stage == 0
-    assert config.update_launch_curriculum(qualifying_success)
-    assert config.launch_curriculum_stage == 1
+    qualifying_gate_rate = config.curriculum_gate_threshold
+
+    assert not config.update_launch_curriculum(
+        config.stage0_minimum_steps - 1,
+        qualifying_success,
+        qualifying_gate_rate,
+    )
     assert config.curriculum_success_streak == 0
 
-    assert not config.update_launch_curriculum(qualifying_success)
+    assert not config.update_launch_curriculum(
+        config.stage0_minimum_steps,
+        qualifying_success,
+        qualifying_gate_rate - 0.01,
+    )
+    for _ in range(config.curriculum_required_evaluations - 1):
+        assert not config.update_launch_curriculum(
+            config.stage0_minimum_steps,
+            qualifying_success,
+            qualifying_gate_rate,
+        )
+        assert config.launch_curriculum_stage == 0
+    assert config.update_launch_curriculum(
+        config.stage0_minimum_steps,
+        qualifying_success,
+        qualifying_gate_rate,
+    )
+    assert config.launch_curriculum_stage == 1
+    assert config.curriculum_success_streak == 0
+    assert config.curriculum_stage_start_step == config.stage0_minimum_steps
+
+    assert not config.update_launch_curriculum(
+        config.stage0_minimum_steps + config.stage1_minimum_steps - 1,
+        qualifying_success,
+        qualifying_gate_rate,
+    )
     assert config.curriculum_success_streak == 0
 
 
@@ -217,12 +244,39 @@ def test_e2e_stage_one_activates_rl_aim_only_when_rule_timing_is_met():
     env = InterceptionEnv(make_simple_config(mode="e2e", launch_curriculum_stage=1))
     try:
         env.reset(seed=10_000)
+        assert np.allclose(env.action_mask(), np.zeros(5))
+        env.interceptor.position = env.target.position - 10.0 * unit_vector(env.target.velocity)
+        env.interceptor.velocity = env.target.velocity + 6.0 * unit_vector(env.target.velocity)
+        assert np.allclose(env.action_mask(), np.array([0.0, 0.0, 0.0, 1.0, 1.0]))
+        _, _, source = env.decode_action(np.zeros(5, dtype=np.float32))
+        assert source == "rl_aim"
+    finally:
+        env.close()
+
+
+def test_e2e_launch_step_masks_unused_guidance_and_records_teacher_angles():
+    env = InterceptionEnv(make_simple_config(mode="e2e", launch_curriculum_stage=0))
+    try:
+        env.reset(seed=10_000)
+        env.interceptor.position = env.target.position - 10.0 * unit_vector(env.target.velocity)
+        env.interceptor.velocity = env.target.velocity + 6.0 * unit_vector(env.target.velocity)
+        assert np.allclose(env.action_mask(), np.zeros(5))
+        _, _, _, _, info = env.step(np.ones(5, dtype=np.float32))
+        assert info["launch_used"]
+        assert info["launch_source"] == "rule_aim"
+        assert np.isfinite(info["teacher_aim_action"]).all()
+    finally:
+        env.close()
+
+
+def test_e2e_stage_two_joint_mask_switches_between_guidance_and_aim():
+    env = InterceptionEnv(make_simple_config(mode="e2e", launch_curriculum_stage=2))
+    try:
+        env.reset(seed=10_000)
         assert np.allclose(env.action_mask(), np.array([1.0, 1.0, 1.0, 0.0, 0.0]))
         env.interceptor.position = env.target.position - 10.0 * unit_vector(env.target.velocity)
         env.interceptor.velocity = env.target.velocity + 6.0 * unit_vector(env.target.velocity)
-        assert np.allclose(env.action_mask(), np.ones(5))
-        _, _, source = env.decode_action(np.zeros(5, dtype=np.float32))
-        assert source == "rl_aim"
+        assert np.allclose(env.action_mask(), np.array([0.0, 0.0, 0.0, 1.0, 1.0]))
     finally:
         env.close()
 

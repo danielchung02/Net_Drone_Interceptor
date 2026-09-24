@@ -191,6 +191,7 @@ class InterceptionEnv(gym.Env):
         self.launch_distance = float("nan") #발사 시점의 요격기-타겟 거리
         self.launch_time = float("nan")
         self.launch_source: Optional[str] = None
+        self.launch_teacher_aim = np.full(2, np.nan, dtype=np.float32)
         self.capture_time = float("nan")
         self.gate_ever_open = False
         self.gate_open_steps = 0
@@ -285,15 +286,42 @@ class InterceptionEnv(gym.Env):
     def uses_rl_aim(self) -> bool:
         """PN always learns aim; E2E learns it only after curriculum stage 0."""
 
-        return self.config.mode == "pn" or self.config.launch_curriculum_stage == 1
+        return self.config.mode == "pn" or self.config.launch_curriculum_stage >= 1
 
     def action_mask(self) -> np.ndarray:
         """Mark action dimensions that can affect the current transition."""
 
-        aim_active = float(self.uses_rl_aim() and self.launch_gate_open())
+        gate_open = self.launch_gate_open()
+        aim_active = float(self.uses_rl_aim() and gate_open)
         if self.config.mode == "pn":
             return np.array([aim_active, aim_active], dtype=np.float32)
-        return np.array([1.0, 1.0, 1.0, aim_active, aim_active], dtype=np.float32)
+        if gate_open:
+            return np.array([0.0, 0.0, 0.0, aim_active, aim_active], dtype=np.float32)
+        if self.config.launch_curriculum_stage == 1:
+            # Guidance is executed deterministically but frozen during aim learning.
+            return np.zeros(5, dtype=np.float32)
+        return np.array([1.0, 1.0, 1.0, 0.0, 0.0], dtype=np.float32)
+
+    def direction_to_aim_action(self, direction: np.ndarray) -> np.ndarray:
+        """Convert a world-frame direction into normalized LOS-relative angles."""
+
+        line_of_sight, horizontal_axis, vertical_axis = self.line_of_sight_basis()
+        direction = unit(direction)
+        elevation = np.arcsin(np.clip(np.dot(direction, vertical_axis), -1.0, 1.0))
+        azimuth = np.arctan2(
+            np.dot(direction, horizontal_axis),
+            np.dot(direction, line_of_sight),
+        )
+        return np.array(
+            [
+                np.clip(azimuth / self.config.launch_azimuth_limit, -1.0, 1.0),
+                np.clip(elevation / self.config.launch_elevation_limit, -1.0, 1.0),
+            ],
+            dtype=np.float32,
+        )
+
+    def ballistic_aim_action(self) -> np.ndarray:
+        return self.direction_to_aim_action(self.ballistic_launch_direction())
 
     def decode_action(self, action: np.ndarray) -> Tuple[np.ndarray, np.ndarray, str]:
         line_of_sight, horizontal_axis, vertical_axis = self.line_of_sight_basis()
@@ -492,6 +520,7 @@ class InterceptionEnv(gym.Env):
             "launch_time": self.launch_time,
             "launch_used": self.launch_used,
             "launch_source": self.launch_source,
+            "teacher_aim_action": self.launch_teacher_aim.copy(),
             "rule_aim": self.launch_source == "rule_aim",
             "rl_aim": self.launch_source == "rl_aim",
             "gate_ever_open": self.gate_ever_open,
@@ -522,6 +551,7 @@ class InterceptionEnv(gym.Env):
         desired_acceleration, launch_direction, launch_source = self.decode_action(action)
         launched_now = not self.launch_used and gate_open
         if launched_now:
+            self.launch_teacher_aim = self.ballistic_aim_action()
             self.launch(launch_direction, launch_source)
 
         if launched_now:
@@ -609,20 +639,7 @@ class InterceptionEnv(gym.Env):
     def heuristic_action(self) -> np.ndarray:
         """Deterministic feasibility check with the analytic ballistic direction."""
 
-        line_of_sight, horizontal_axis, vertical_axis = self.line_of_sight_basis()
-        direction = self.ballistic_launch_direction()
-        elevation = np.arcsin(np.clip(np.dot(direction, vertical_axis), -1.0, 1.0))
-        azimuth = np.arctan2(
-            np.dot(direction, horizontal_axis),
-            np.dot(direction, line_of_sight),
-        )
-        aim = np.array(
-            [
-                np.clip(azimuth / self.config.launch_azimuth_limit, -1.0, 1.0),
-                np.clip(elevation / self.config.launch_elevation_limit, -1.0, 1.0),
-            ],
-            dtype=np.float32,
-        )
+        aim = self.ballistic_aim_action()
         if self.config.mode == "pn":
             return aim
         return np.concatenate([np.zeros(3, dtype=np.float32), aim])

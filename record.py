@@ -86,7 +86,7 @@ def main() -> None:
     parser.add_argument("--scenario-seed", type=int, default=10_000)
     parser.add_argument(
         "--checkpoint",
-        choices=["best", "last", "stage0_best", "stage1_best"],
+        choices=["best", "last", "stage0_best", "stage1_best", "stage2_best"],
         default="best",
     )
     parser.add_argument("--physics-engine", choices=["rotorpy", "simple"], default=None)
@@ -111,6 +111,12 @@ def main() -> None:
     )
     config.curriculum_success_streak = int(
         checkpoint.get("curriculum_success_streak", 0)
+    )
+    config.curriculum_stage_start_step = int(
+        checkpoint.get(
+            "curriculum_stage_start_step",
+            checkpoint.get("total_steps", checkpoint.get("steps", 0)),
+        )
     )
     actor = load_actor(
         args.agent,

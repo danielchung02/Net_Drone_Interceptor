@@ -22,7 +22,7 @@ from config import ExperimentConfig
 from interception_env import InterceptionEnv
 
 
-def mask_inactive_aim(states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+def action_masks(states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
     masks = torch.ones_like(actions)
     gate_open = states[..., -2] > 0.5
     if actions.shape[-1] == 2:
@@ -30,8 +30,21 @@ def mask_inactive_aim(states: torch.Tensor, actions: torch.Tensor) -> torch.Tens
     else:
         rl_aim_stage = states[..., -1] > 0.5
         aim_active = (gate_open & rl_aim_stage).unsqueeze(-1).to(actions.dtype)
+        masks[..., :3] = (~gate_open).unsqueeze(-1).to(actions.dtype)
         masks[..., 3:5] = aim_active
-    return actions * masks
+    return masks
+
+
+def learning_action_masks(states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    masks = action_masks(states, actions)
+    if actions.shape[-1] == 5:
+        stage_one = (states[..., -1] > 0.5) & (states[..., -1] < 1.5)
+        masks[..., :3] *= (~stage_one).unsqueeze(-1).to(actions.dtype)
+    return masks
+
+
+def mask_inactive_aim(states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    return actions * action_masks(states, actions)
 
 
 def mask_inactive_aim_numpy(state: np.ndarray, action: np.ndarray) -> np.ndarray:
@@ -39,9 +52,18 @@ def mask_inactive_aim_numpy(state: np.ndarray, action: np.ndarray) -> np.ndarray
     if action.shape[-1] == 2:
         if state[-2] <= 0.5:
             action[:] = 0.0
-    elif state[-1] <= 0.5 or state[-2] <= 0.5:
-        action[3:5] = 0.0
+    else:
+        if state[-2] > 0.5:
+            action[:3] = 0.0
+        if state[-1] <= 0.5 or state[-2] <= 0.5:
+            action[3:5] = 0.0
     return action
+
+
+def learning_action_mask_numpy(state: np.ndarray, action: np.ndarray) -> np.ndarray:
+    state_tensor = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)
+    action_tensor = torch.as_tensor(action, dtype=torch.float32).unsqueeze(0)
+    return learning_action_masks(state_tensor, action_tensor).squeeze(0).numpy()
 
 
 class AgentHyperParameters:
@@ -63,6 +85,11 @@ class AgentHyperParameters:
         self.noise_clip = 0.50
         self.policy_delay = 2
         self.max_grad_norm = 10.0
+        self.imitation_learning_rate = 1e-3
+        self.imitation_epochs = 20
+        self.imitation_minibatch_size = 128
+        self.imitation_buffer_size = 2_048
+        self.joint_finetune_learning_rate = 1e-4
 
     def to_dict(self) -> Dict[str, object]:
         return self.__dict__.copy()
@@ -80,7 +107,18 @@ class Actor(nn.Module):
         )
 
     def forward(self, states: torch.Tensor) -> torch.Tensor:
-        return torch.tanh(self.net(states))
+        actor_states = states
+        if self.net[-1].out_features == 5:
+            actor_states = states.clone()
+            actor_states[..., -1] = 0.0
+        return torch.tanh(self.net(actor_states))
+
+    def set_guidance_frozen(self, frozen: bool) -> None:
+        if self.net[-1].out_features != 5:
+            return
+        for layer in list(self.net.children())[:-1]:
+            for parameter in layer.parameters():
+                parameter.requires_grad_(not frozen)
 
 
 class TwinCritic(nn.Module):
@@ -135,11 +173,12 @@ class TD3Agent:
         with torch.no_grad():
             action = self.actor(state_tensor).squeeze(0).cpu().numpy()
         if add_noise:
-            action += np.random.normal(
+            noise = np.random.normal(
                 0.0,
                 self.hyperparameters.exploration_noise_std,
                 size=action.shape,
             ).astype(np.float32)
+            action += noise * learning_action_mask_numpy(state, action)
         action = np.clip(action, -1.0, 1.0).astype(np.float32)
         return mask_inactive_aim_numpy(state, action)
 
@@ -160,6 +199,7 @@ class TD3Agent:
         with torch.no_grad():
             target_noise = torch.randn_like(actions) * self.hyperparameters.policy_noise
             target_noise = torch.clamp(target_noise, -self.hyperparameters.noise_clip, self.hyperparameters.noise_clip)
+            target_noise *= learning_action_masks(next_states, actions)
             target_actions = torch.clamp(self.target_actor(next_states) + target_noise, -1.0, 1.0)
             target_actions = mask_inactive_aim(next_states, target_actions)
             target_q1, target_q2 = self.target_critic(next_states, target_actions)
@@ -179,7 +219,12 @@ class TD3Agent:
         if self.update_count % self.hyperparameters.policy_delay == 0:
             for parameter in self.critic.parameters():
                 parameter.requires_grad_(False)
-            actor_actions = mask_inactive_aim(states, self.actor(states))
+            raw_actor_actions = self.actor(states)
+            learning_masks = learning_action_masks(states, raw_actor_actions)
+            actor_actions = raw_actor_actions.detach() + learning_masks * (
+                raw_actor_actions - raw_actor_actions.detach()
+            )
+            actor_actions = mask_inactive_aim(states, actor_actions)
             actor_loss_tensor = -self.critic.q1(states, actor_actions).mean()
             self.actor_optimizer.zero_grad()
             actor_loss_tensor.backward()
@@ -199,6 +244,52 @@ class TD3Agent:
             "actor_grad_norm": actor_grad_norm,
             "critic_grad_norm": critic_grad_norm,
         }
+
+    def reset_for_stage(self, config: ExperimentConfig) -> None:
+        frozen = config.mode == "e2e" and config.launch_curriculum_stage == 1
+        self.actor.set_guidance_frozen(frozen)
+        actor_learning_rate = (
+            self.hyperparameters.joint_finetune_learning_rate
+            if config.mode == "e2e" and config.launch_curriculum_stage == 2
+            else self.hyperparameters.actor_learning_rate
+        )
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_learning_rate)
+        for module in self.critic.modules():
+            if isinstance(module, nn.Linear):
+                module.reset_parameters()
+        self.target_actor = copy.deepcopy(self.actor).to(self.device)
+        self.target_critic = copy.deepcopy(self.critic).to(self.device)
+        for parameter in self.target_actor.parameters():
+            parameter.requires_grad_(False)
+        for parameter in self.target_critic.parameters():
+            parameter.requires_grad_(False)
+        self.critic_optimizer = optim.Adam(
+            self.critic.parameters(), lr=self.hyperparameters.critic_learning_rate
+        )
+        self.update_count = 0
+
+
+def imitate_ballistic_aim(agent, states, targets, hyperparameters) -> float:
+    if len(states) == 0:
+        return float("nan")
+    agent.actor.set_guidance_frozen(True)
+    state_tensor = torch.as_tensor(states, dtype=torch.float32, device=agent.device)
+    target_tensor = torch.as_tensor(targets, dtype=torch.float32, device=agent.device)
+    optimizer = optim.Adam(
+        [parameter for parameter in agent.actor.parameters() if parameter.requires_grad],
+        lr=hyperparameters.imitation_learning_rate,
+    )
+    losses = []
+    for _ in range(hyperparameters.imitation_epochs):
+        indices = torch.randperm(len(state_tensor), device=agent.device)
+        for start in range(0, len(state_tensor), hyperparameters.imitation_minibatch_size):
+            batch = indices[start : start + hyperparameters.imitation_minibatch_size]
+            loss = (agent.actor(state_tensor[batch])[:, -2:] - target_tensor[batch]).pow(2).mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            losses.append(float(loss.item()))
+    return float(np.mean(losses))
 
 
 def evaluate(env, agent: TD3Agent, config: ExperimentConfig) -> Dict[str, float]:
@@ -233,6 +324,7 @@ def save_checkpoint(
         "best_return": best_return,
         "launch_curriculum_stage": config.launch_curriculum_stage,
         "curriculum_success_streak": config.curriculum_success_streak,
+        "curriculum_stage_start_step": config.curriculum_stage_start_step,
     }
     if replay_buffer is not None:
         checkpoint["replay_buffer"] = replay_buffer.state_dict()
@@ -260,6 +352,7 @@ def prepare_run(config: ExperimentConfig, hyperparameters: AgentHyperParameters)
         "{}_best.pt".format(prefix),
         "{}_stage0_best.pt".format(prefix),
         "{}_stage1_best.pt".format(prefix),
+        "{}_stage2_best.pt".format(prefix),
         "{}_last.pt".format(prefix),
         "{}_config.json".format(prefix),
         "{}_train_metrics.csv".format(prefix),
@@ -324,6 +417,12 @@ def train(config: ExperimentConfig):
         best_return = float(checkpoint.get("best_return", -float("inf")))
         config.launch_curriculum_stage = int(checkpoint.get("launch_curriculum_stage", 0))
         config.curriculum_success_streak = int(checkpoint.get("curriculum_success_streak", 0))
+        config.curriculum_stage_start_step = int(
+            checkpoint.get("curriculum_stage_start_step", starting_steps)
+        )
+        agent.actor.set_guidance_frozen(
+            config.mode == "e2e" and config.launch_curriculum_stage == 1
+        )
         training_end_step = starting_steps + config.additional_train_steps if config.additional_train_steps > 0 else None
         destination = training_end_step if training_end_step is not None else "manual stop"
         print("resumed td3 {} at step {}; training to {}".format(config.mode, starting_steps, destination))
@@ -340,6 +439,8 @@ def train(config: ExperimentConfig):
     state, _ = env.reset(seed=seed + starting_steps)
     episode_return = 0.0
     episode_length = 0
+    imitation_states = []
+    imitation_targets = []
 
     try:
         total_steps = starting_steps
@@ -351,8 +452,15 @@ def train(config: ExperimentConfig):
                 action = agent.select_action(state, add_noise=True)
             action = mask_inactive_aim_numpy(state, action)
 
-            next_state, reward, terminated, truncated, _ = env.step(action)
+            next_state, reward, terminated, truncated, info = env.step(action)
             replay_buffer.add(state, action, reward, next_state, terminated, truncated)
+            if info["launch_source"] == "rule_aim":
+                teacher_state = np.asarray(state, dtype=np.float32).copy()
+                teacher_state[-1] = 1.0
+                imitation_states.append(teacher_state)
+                imitation_targets.append(np.asarray(info["teacher_aim_action"], dtype=np.float32))
+                imitation_states = imitation_states[-hyperparameters.imitation_buffer_size :]
+                imitation_targets = imitation_targets[-hyperparameters.imitation_buffer_size :]
             episode_return += float(reward)
             episode_length += 1
 
@@ -385,11 +493,12 @@ def train(config: ExperimentConfig):
                 evaluation["total_steps"] = total_steps
                 append_csv_row(eval_log_path, EVAL_METRIC_FIELDS, evaluation)
                 print(
-                    "steps: {} | stage: {} | success: {:.1%} | rule/RL aim: {:.1%}/{:.1%} | return: {:.2f} | "
+                    "steps: {} | stage: {} | success: {:.1%} | gate: {:.1%} | rule/RL aim: {:.1%}/{:.1%} | return: {:.2f} | "
                     "actor/critic: {:.3f}/{:.3f} | Q/target: {:.2f}/{:.2f}".format(
                         total_steps,
                         config.launch_curriculum_name,
                         evaluation["success_rate"],
+                        evaluation["gate_open_rate"],
                         evaluation["rule_aim_rate"],
                         evaluation["rl_aim_rate"],
                         evaluation["mean_return"],
@@ -423,8 +532,23 @@ def train(config: ExperimentConfig):
                         best_return, config,
                         output_dir / "{}_stage{}_best.pt".format(prefix, config.launch_curriculum_stage),
                     )
-                if config.update_launch_curriculum(evaluation["success_rate"]):
-                    print("aim curriculum advanced to {}".format(config.launch_curriculum_name))
+                if config.update_launch_curriculum(
+                    total_steps, evaluation["success_rate"], evaluation["gate_open_rate"]
+                ):
+                    if config.launch_curriculum_stage == 1:
+                        imitation_loss = imitate_ballistic_aim(
+                            agent,
+                            np.asarray(imitation_states, dtype=np.float32),
+                            np.asarray(imitation_targets, dtype=np.float32),
+                            hyperparameters,
+                        )
+                        print("ballistic aim imitation samples={} loss={:.6f}".format(
+                            len(imitation_states), imitation_loss
+                        ))
+                    agent.reset_for_stage(config)
+                    print("aim curriculum advanced to {}; critic and optimizers reset".format(
+                        config.launch_curriculum_name
+                    ))
                     best_success = -float("inf")
                     best_min_net_distance = float("inf")
                     best_return = -float("inf")

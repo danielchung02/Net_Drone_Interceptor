@@ -117,4 +117,39 @@ SciPy 1.15.3
 - tanh-Gaussian log probability의 Jacobian을 수치적으로 안정적인 식으로 계산한다.
 - PPO/A2C의 `log_std`를 `[-5, 1]`, gradient norm을 `0.5`로 제한한다.
 ==========================================
+## 0924
+현재 상태 다시 정리
+PN:한 단계만 사용
+Stage 1: rl_los_aim
+유도              = PN 규칙 기반
+발사 시점         = 규칙 기반
+발사 방향         = RL
+action            = [LOS 좌우각, LOS 상하각]
 
+발사조건
+거리 ≤ 15 m
+closing speed ≥ 5 m/s
+
+E2E:
+Stage 0: guidance_with_rule_aim
+유도              = RL
+발사 시점         = 규칙 기반
+발사 방향         = 탄도해 규칙
+학습 action       = 가속도 3개
+발사각 2개        = masking
+
+평가 성공률 80% 이상을 2회 연속 달성하면
+Stage 1: rl_los_aim
+유도              = RL
+발사 시점         = 규칙 기반
+발사 방향         = RL
+학습 action       = 가속도 3개 + 발사각 2개
+
+###  수정 사항
+
+- E2E 발사 step에서 실제로 사용되지 않는 가속도 action까지 학습되던 mask 오류를 수정했다.
+- Stage 0은 최소 200만 step 학습하고, 성공률과 gate 진입률이 모두 90% 이상인 평가를 5회 연속 통과해야 Stage 1로 전환한다.
+- Stage 1 진입 전에 analytic ballistic angle로 발사각 출력을 짧게 imitation 학습한다. 이후 유도 network를 동결하고 발사각만 학습한다.
+- Stage 1을 최소 100만 step 학습한 뒤 같은 90%·5회 조건을 만족하면 Stage 2로 전환한다. Stage 2에서는 전체 network를 learning rate 1e-4로 joint fine-tuning한다.
+- 단계 전환 시 critic과 optimizer를 초기화하며, off-policy agent는 이전 단계의 replay buffer도 비운다. `stage2_best.pt` 저장과 `last.pt` 재개 학습을 지원한다.
+- PN은 모든 agent에서 동일한 PN 유도, 15 m·closing speed 5 m/s gate, 2차원 LOS 발사각, 보상과 평가 seed를 사용한다.

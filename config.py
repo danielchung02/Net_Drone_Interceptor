@@ -63,13 +63,18 @@ class ExperimentConfig:
         self.net_speed = 45.0 
         self.net_capture_radius = 2.0
 
-        # Aim curriculum. PN starts at stage 1; E2E starts at stage 0.
-        # 0: rule-based ballistic aim while E2E learns guidance.
-        # 1: RL directly chooses LOS-relative launch angles.
+        # E2E aim curriculum. PN uses RL aim directly and does not advance.
+        # 0: learn guidance with rule-based ballistic aim.
+        # 1: freeze guidance and learn only the two launch angles.
+        # 2: jointly fine-tune guidance and launch angles at a lower rate.
         self.launch_curriculum_stage = 0
-        self.curriculum_success_threshold = 0.80
-        self.curriculum_required_evaluations = 2
+        self.curriculum_success_threshold = 0.90
+        self.curriculum_gate_threshold = 0.90
+        self.curriculum_required_evaluations = 5
         self.curriculum_success_streak = 0
+        self.curriculum_stage_start_step = 0
+        self.stage0_minimum_steps = 2_000_000
+        self.stage1_minimum_steps = 1_000_000
         self.fixed_auto_launch_distance = 15.0
         self.launch_gate_min_closing_speed = 5.0
         self.launch_azimuth_limit = 0.5235987755982988  # 30 degrees
@@ -103,8 +108,8 @@ class ExperimentConfig:
             raise ValueError("evaluation seed bank is shorter than n_eval_episodes")
         if self.total_train_steps is not None and self.total_train_steps <= 0:
             raise ValueError("total_train_steps must be positive or None")
-        if self.launch_curriculum_stage not in {0, 1}:
-            raise ValueError("launch_curriculum_stage must be 0 or 1")
+        if self.launch_curriculum_stage not in {0, 1, 2}:
+            raise ValueError("launch_curriculum_stage must be 0, 1, or 2")
         for name in (
             "target_sine_horizontal_amplitude_range",
             "target_sine_vertical_amplitude_range",
@@ -117,14 +122,37 @@ class ExperimentConfig:
 
     @property
     def launch_curriculum_name(self) -> str:
-        return ("guidance_with_rule_aim", "rl_los_aim")[self.launch_curriculum_stage]
+        if self.mode == "pn":
+            return "rl_los_aim"
+        return (
+            "guidance_with_rule_aim",
+            "frozen_guidance_aim_learning",
+            "joint_finetuning",
+        )[self.launch_curriculum_stage]
 
-    def update_launch_curriculum(self, success_rate: float) -> bool:
-        """Advance only after repeated held-out success, never from a step count."""
+    def update_launch_curriculum(
+        self,
+        total_steps: int,
+        success_rate: float,
+        gate_open_rate: float,
+    ) -> bool:
+        """Advance E2E only after minimum practice and repeated stable evaluation."""
 
-        if self.launch_curriculum_stage >= 1:
+        if self.mode != "e2e" or self.launch_curriculum_stage >= 2:
             return False
-        qualifies = success_rate >= self.curriculum_success_threshold
+        minimum_steps = (
+            self.stage0_minimum_steps
+            if self.launch_curriculum_stage == 0
+            else self.stage1_minimum_steps
+        )
+        stage_steps = total_steps - self.curriculum_stage_start_step
+        if stage_steps < minimum_steps:
+            self.curriculum_success_streak = 0
+            return False
+        qualifies = (
+            success_rate >= self.curriculum_success_threshold
+            and gate_open_rate >= self.curriculum_gate_threshold
+        )
         if qualifies:
             self.curriculum_success_streak += 1
         else:
@@ -133,6 +161,7 @@ class ExperimentConfig:
             return False
         self.launch_curriculum_stage += 1
         self.curriculum_success_streak = 0
+        self.curriculum_stage_start_step = total_steps
         return True
 
     def load_dict(self, values: Dict[str, object]) -> None:
