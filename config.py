@@ -10,9 +10,13 @@ class ExperimentConfig:
         self.mode = "pn"
         self.seed = 0
         self.device = "auto"
-        # None means that training continues until the process is interrupted.
-        self.total_train_steps = None
-        self.eval_interval_steps = 100_000
+        # Every algorithm-distance pair receives the same environment-step budget.
+        self.total_train_steps = 4_000_000
+        self.eval_interval_steps = 5_000
+        self.convergence_success_threshold = 0.95
+        self.convergence_required_evaluations = 10
+        self.convergence_success_streak = 0
+        self.convergence_step = None
         self.save_interval_steps = 100_000
         self.n_eval_episodes = 20
         self.eval_seed_bank = tuple(range(10_000, 10_020))
@@ -108,6 +112,14 @@ class ExperimentConfig:
             raise ValueError("evaluation seed bank is shorter than n_eval_episodes")
         if self.total_train_steps is not None and self.total_train_steps <= 0:
             raise ValueError("total_train_steps must be positive or None")
+        if self.eval_interval_steps <= 0:
+            raise ValueError("eval_interval_steps must be positive")
+        if not 0.0 < self.convergence_success_threshold <= 1.0:
+            raise ValueError("convergence_success_threshold must be in (0, 1]")
+        if self.convergence_required_evaluations <= 0:
+            raise ValueError("convergence_required_evaluations must be positive")
+        if self.fixed_auto_launch_distance <= 0.0:
+            raise ValueError("fixed_auto_launch_distance must be positive")
         if self.launch_curriculum_stage not in {0, 1, 2}:
             raise ValueError("launch_curriculum_stage must be 0, 1, or 2")
         for name in (
@@ -188,7 +200,27 @@ class ExperimentConfig:
     def physics_substeps(self) -> int:
         return int(round(self.control_dt / self.physics_dt))
 
+    def next_evaluation_step(self, total_steps: int) -> int:
+        return (
+            total_steps // self.eval_interval_steps + 1
+        ) * self.eval_interval_steps
+
+    def update_training_convergence(self, total_steps: int, success_rate: float) -> bool:
+        if self.mode != "pn":
+            return False
+        if success_rate >= self.convergence_success_threshold:
+            self.convergence_success_streak += 1
+        else:
+            self.convergence_success_streak = 0
+        if self.convergence_success_streak < self.convergence_required_evaluations:
+            return False
+        self.convergence_step = int(total_steps)
+        return True
+
     def agent_run_dir(self, agent_name: str) -> Path:
+        if self.mode == "pn":
+            distance_name = "distance_{:g}m".format(self.fixed_auto_launch_distance)
+            return Path(self.run_root) / self.mode / distance_name / agent_name
         return Path(self.run_root) / self.mode / agent_name
 
     def to_dict(self) -> Dict[str, object]:

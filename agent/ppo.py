@@ -378,6 +378,8 @@ def _save(
             "launch_curriculum_stage": config.launch_curriculum_stage,
             "curriculum_success_streak": config.curriculum_success_streak,
             "curriculum_stage_start_step": config.curriculum_stage_start_step,
+            "convergence_success_streak": config.convergence_success_streak,
+            "convergence_step": config.convergence_step,
         },
         path,
     )
@@ -389,6 +391,8 @@ def load_last(path: Path, model: ActorCritic, optimizer: optim.Optimizer, device
     optimizer.load_state_dict(checkpoint["optimizer"])
     config.launch_curriculum_stage = int(checkpoint.get("launch_curriculum_stage", 0))
     config.curriculum_success_streak = int(checkpoint.get("curriculum_success_streak", 0))
+    config.convergence_success_streak = int(checkpoint.get("convergence_success_streak", 0))
+    config.convergence_step = checkpoint.get("convergence_step")
     config.curriculum_stage_start_step = int(
         checkpoint.get("curriculum_stage_start_step", checkpoint.get("steps", 0))
     )
@@ -435,7 +439,7 @@ def train(config: ExperimentConfig) -> ActorCritic:
         print("resumed ppo {} at step {}; training to {}".format(config.mode, total_steps, destination))
     else:
         training_end_step = config.total_train_steps
-    next_evaluation = (total_steps // config.eval_interval_steps + 1) * config.eval_interval_steps
+    next_evaluation = config.next_evaluation_step(total_steps)
     next_save = (total_steps // config.save_interval_steps + 1) * config.save_interval_steps
     state, _ = env.reset(seed=config.seed + total_steps)
     metrics = {"policy_loss": float("nan"), "value_loss": float("nan"), "entropy": float("nan")}
@@ -537,8 +541,16 @@ def train(config: ExperimentConfig) -> ActorCritic:
                         run_dir / "{}_last.pt".format(prefix), model, optimizer, total_steps,
                         best_success, best_min_net_distance, best_return, config,
                     )
-                while next_evaluation <= total_steps:
-                    next_evaluation += config.eval_interval_steps
+                if config.update_training_convergence(total_steps, result["success_rate"]):
+                    print(
+                        "converged at {} steps: success >= {:.0%} for {} consecutive evaluations".format(
+                            total_steps,
+                            config.convergence_success_threshold,
+                            config.convergence_required_evaluations,
+                        )
+                    )
+                    break
+                next_evaluation = config.next_evaluation_step(total_steps)
             if total_steps >= next_save:
                 _save(
                     run_dir / "{}_last.pt".format(prefix), model, optimizer, total_steps,

@@ -40,6 +40,43 @@ def test_initial_geometry_and_dimensions():
         env.close()
 
 
+def test_pn_run_directory_separates_launch_distances():
+    config = make_simple_config(mode="pn", fixed_auto_launch_distance=20.0)
+    assert config.agent_run_dir("ppo").as_posix() == "runs/pn/distance_20m/ppo"
+
+    config.fixed_auto_launch_distance = 22.5
+    assert config.agent_run_dir("ppo").as_posix() == "runs/pn/distance_22.5m/ppo"
+
+    config.mode = "e2e"
+    assert config.agent_run_dir("ppo").as_posix() == "runs/e2e/ppo"
+
+
+def test_pn_evaluates_every_five_thousand_steps():
+    config = make_simple_config(mode="pn")
+    assert config.next_evaluation_step(0) == 5_000
+    assert config.next_evaluation_step(5_000) == 10_000
+    assert config.next_evaluation_step(3_995_000) == 4_000_000
+
+
+def test_pn_converges_after_ten_consecutive_evaluations_at_ninety_five_percent():
+    config = make_simple_config(mode="pn")
+    for index in range(config.convergence_required_evaluations - 1):
+        assert not config.update_training_convergence(
+            (index + 1) * config.eval_interval_steps,
+            config.convergence_success_threshold,
+        )
+    assert config.update_training_convergence(
+        config.convergence_required_evaluations * config.eval_interval_steps,
+        config.convergence_success_threshold,
+    )
+    assert config.convergence_step == 50_000
+
+    config = make_simple_config(mode="pn")
+    config.update_training_convergence(5_000, 1.0)
+    config.update_training_convergence(10_000, 0.90)
+    assert config.convergence_success_streak == 0
+
+
 def test_timeout_is_truncated_and_keeps_final_observation():
     env = InterceptionEnv(make_simple_config(debug_max_steps=1))
     try:

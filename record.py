@@ -91,15 +91,25 @@ def main() -> None:
     )
     parser.add_argument("--physics-engine", choices=["rotorpy", "simple"], default=None)
     parser.add_argument("--run-root", default="runs")
+    parser.add_argument(
+        "--launch-distance",
+        type=float,
+        default=None,
+        help="PN launch distance used to select runs/pn/distance_<meters>m/<agent>",
+    )
     parser.add_argument("--no-video", action="store_true")
     args = parser.parse_args()
 
-    run_dir = Path(args.run_root) / args.mode / args.agent
+    config = ExperimentConfig()
+    config.mode = args.mode
+    config.run_root = args.run_root
+    if args.launch_distance is not None:
+        config.fixed_auto_launch_distance = args.launch_distance
+    run_dir = config.agent_run_dir(args.agent)
     prefix = "seed_{}".format(args.seed)
     with (run_dir / "{}_config.json".format(prefix)).open(encoding="utf-8") as file:
         saved = json.load(file)
     environment = saved["environment"]
-    config = ExperimentConfig()
     config.load_dict(environment)
     if args.physics_engine is not None:
         config.physics_engine = args.physics_engine

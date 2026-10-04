@@ -21,6 +21,12 @@ def arguments():
     parser.add_argument("--eval-interval", type=int, default=None)
     parser.add_argument("--save-interval", type=int, default=None)
     parser.add_argument("--eval-episodes", type=int, default=None)
+    parser.add_argument(
+        "--launch-distance",
+        type=float,
+        default=None,
+        help="PN rule-based launch distance in meters; also selects the distance-specific run folder",
+    )
     parser.add_argument("--run-root", default=None)
     parser.add_argument("--physics-engine", choices=["rotorpy", "simple"], default="rotorpy")
     parser.add_argument("--device", default="auto")
@@ -94,6 +100,8 @@ def main() -> None:
     # E2E first learns guidance while the analytic ballistic aim acts as teacher.
     config.launch_curriculum_stage = 1 if args.mode == "pn" else 0
     config.seed = args.seed
+    if args.launch_distance is not None:
+        config.fixed_auto_launch_distance = args.launch_distance
     if args.total_steps is not None:
         config.total_train_steps = args.total_steps
     if args.eval_interval is not None:

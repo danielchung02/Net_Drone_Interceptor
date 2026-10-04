@@ -297,6 +297,8 @@ def save_checkpoint(
         "launch_curriculum_stage": config.launch_curriculum_stage,
         "curriculum_success_streak": config.curriculum_success_streak,
         "curriculum_stage_start_step": config.curriculum_stage_start_step,
+        "convergence_success_streak": config.convergence_success_streak,
+        "convergence_step": config.convergence_step,
     }
     if replay_buffer is not None:
         checkpoint["replay_buffer"] = replay_buffer.state_dict()
@@ -388,6 +390,8 @@ def train(config: ExperimentConfig):
         best_return = float(checkpoint.get("best_return", -float("inf")))
         config.launch_curriculum_stage = int(checkpoint.get("launch_curriculum_stage", 0))
         config.curriculum_success_streak = int(checkpoint.get("curriculum_success_streak", 0))
+        config.convergence_success_streak = int(checkpoint.get("convergence_success_streak", 0))
+        config.convergence_step = checkpoint.get("convergence_step")
         config.curriculum_stage_start_step = int(
             checkpoint.get("curriculum_stage_start_step", starting_steps)
         )
@@ -415,6 +419,7 @@ def train(config: ExperimentConfig):
 
     try:
         total_steps = starting_steps
+        next_eval_step = config.next_evaluation_step(total_steps)
         while training_end_step is None or total_steps < training_end_step:
             total_steps += 1
             if total_steps <= hyperparameters.start_steps:
@@ -459,7 +464,7 @@ def train(config: ExperimentConfig):
                 for _ in range(hyperparameters.updates_per_step):
                     metrics = agent.update_ddpg(replay_buffer)
 
-            if total_steps % config.eval_interval_steps == 0 or (
+            if total_steps >= next_eval_step or (
                 training_end_step is not None and total_steps == training_end_step
             ):
                 evaluation = evaluate(eval_env, agent, config)
@@ -532,6 +537,16 @@ def train(config: ExperimentConfig):
                         agent, total_steps, best_success, best_min_net_distance,
                         best_return, config, output_dir / "{}_last.pt".format(prefix), replay_buffer,
                     )
+                if config.update_training_convergence(total_steps, evaluation["success_rate"]):
+                    print(
+                        "converged at {} steps: success >= {:.0%} for {} consecutive evaluations".format(
+                            total_steps,
+                            config.convergence_success_threshold,
+                            config.convergence_required_evaluations,
+                        )
+                    )
+                    break
+                next_eval_step = config.next_evaluation_step(total_steps)
 
             if total_steps % config.save_interval_steps == 0:
                 save_checkpoint(

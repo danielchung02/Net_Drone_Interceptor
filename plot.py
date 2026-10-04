@@ -19,11 +19,22 @@ def parse_arguments():
     parser.add_argument("--algorithms", nargs="+", default=DEFAULT_ALGORITHMS)
     parser.add_argument("--run-root", default="runs")
     parser.add_argument("--figure-root", default="figures")
+    parser.add_argument("--launch-distance", type=float, default=15.0)
     return parser.parse_args()
 
 
-def read_eval_rows(run_root: Path, mode: str, algorithm: str, seed: int) -> List[Dict[str, float]]:
-    path = run_root / mode / algorithm / "seed_{}_eval_metrics.csv".format(seed)
+def read_eval_rows(
+    run_root: Path,
+    mode: str,
+    algorithm: str,
+    seed: int,
+    launch_distance: float,
+) -> List[Dict[str, float]]:
+    if mode == "pn":
+        distance_name = "distance_{:g}m".format(launch_distance)
+        path = run_root / mode / distance_name / algorithm / "seed_{}_eval_metrics.csv".format(seed)
+    else:
+        path = run_root / mode / algorithm / "seed_{}_eval_metrics.csv".format(seed)
     if not path.exists():
         return []
     rows: List[Dict[str, float]] = []
@@ -39,13 +50,14 @@ def aggregate_metric(
     algorithm: str,
     seeds: Sequence[int],
     metric: str = "success_rate",
+    launch_distance: float = 15.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """Align evaluations by training steps and calculate a 95% normal CI."""
 
     values_by_step: Dict[int, List[float]] = defaultdict(list)
     available_seeds = 0
     for seed in seeds:
-        rows = read_eval_rows(run_root, mode, algorithm, seed)
+        rows = read_eval_rows(run_root, mode, algorithm, seed, launch_distance)
         if rows:
             available_seeds += 1
         for row in rows:
@@ -72,6 +84,7 @@ def plot_mode_learning_curves(
     mode: str,
     algorithms: Sequence[str],
     seeds: Sequence[int],
+    launch_distance: float,
 ) -> Dict[str, float]:
     figure, axis = plt.subplots(figsize=(8, 5))
     final_costs: Dict[str, float] = {}
@@ -82,6 +95,7 @@ def plot_mode_learning_curves(
             mode,
             algorithm,
             seeds,
+            launch_distance=launch_distance,
         )
         if len(steps) == 0:
             continue
@@ -110,6 +124,7 @@ def plot_best_mode_comparison(
     best_pn: str,
     best_e2e: str,
     seeds: Sequence[int],
+    launch_distance: float,
 ) -> None:
     figure, axis = plt.subplots(figsize=(8, 5))
     for mode, algorithm in [("pn", best_pn), ("e2e", best_e2e)]:
@@ -118,6 +133,7 @@ def plot_best_mode_comparison(
             mode,
             algorithm,
             seeds,
+            launch_distance=launch_distance,
         )
         if len(steps) == 0:
             continue
@@ -170,6 +186,7 @@ def main():
         "pn",
         arguments.algorithms,
         arguments.seeds,
+        arguments.launch_distance,
     )
     e2e_costs = plot_mode_learning_curves(
         run_root,
@@ -177,11 +194,19 @@ def main():
         "e2e",
         arguments.algorithms,
         arguments.seeds,
+        arguments.launch_distance,
     )
     if pn_costs and e2e_costs:
         best_pn = max(pn_costs, key=pn_costs.get)
         best_e2e = max(e2e_costs, key=e2e_costs.get)
-        plot_best_mode_comparison(run_root, figure_root, best_pn, best_e2e, arguments.seeds)
+        plot_best_mode_comparison(
+            run_root,
+            figure_root,
+            best_pn,
+            best_e2e,
+            arguments.seeds,
+            arguments.launch_distance,
+        )
     plot_final_metric_comparison(figure_root, pn_costs, e2e_costs)
     print("saved figures in {}".format(figure_root))
 
