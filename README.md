@@ -1,155 +1,85 @@
-# RotorPy 기반 PN 대 E2E 요격 연구
+# RotorPy 기반 자율 드론 요격 연구
 
-환경·표적 궤적·PN·발사체는 `interception_env.py` 한 파일에 두고,
-PPO, A2C, DDPG, TD3, SAC는 각각 `agent/`의 독립 파일에 둔다.
-모든 알고리즘은 동일한 PN/E2E 환경과 평가 seed bank를 사용한다.
+3차원 공역에 진입한 표적 드론을 요격 드론이 추적하고, 단 한 번 발사할 수 있는 그물로 포획하는 강화학습 연구입니다. 핵심 질문은 **물리 법칙에 따른 유도(PN)를 유지하면서 발사 방향만 학습하는 방식이 유도·조준을 모두 학습하는 방식보다 실용적인가**입니다.
 
-```text
-config.py             공통 물리·보상·평가 조건
-interception_env.py   RotorPy, 표적, PN, 단발 capture device, Gym 환경
-agent/ppo.py          PPO 모델·학습·평가·checkpoint
-train.py              학습 또는 sanity 실행
-record.py             best/last/stage별 checkpoint의 NPZ·MP4 기록
-runs/                 학습 실행 뒤 자동 생성되는 결과 폴더
+## 1. 연구 목표
+
+RotorPy의 쿼드로터 동역학을 사용하는 환경에서 비례항법(Proportional Navigation, PN) 유도와 강화학습 조준을 결합하고, PPO·A2C·DDPG·TD3·SAC를 같은 조건에서 비교합니다. E2E-PPO는 강화학습이 유도까지 맡을 때의 난도를 확인하는 예비 대조군입니다.
+
+## 2. 연구 내용
+
+### 시뮬레이션과 표적
+
+- 공역은 반지름 100 m의 구이며, 표적과 요격기에는 같은 최대 속도 15 m/s, 최대 가속도 8 m/s², 최대 jerk 30 m/s³을 적용합니다.
+- 두 기체에 RotorPy Crazyflie 모델을 사용합니다. 제어 간격은 0.05 s이고, 한 제어 step을 물리 계산 3회로 나눕니다.
+- 표적은 구면의 무작위 지점에서 진입해 약 135° 떨어진 탈출 방향으로 이동합니다. 기준 속도는 8 m/s이며, 수평·수직 사인 기동과 시간적으로 상관된 OU 잡음을 더합니다. 기동 진폭·주파수와 경로는 episode마다 달라집니다.
+- 그물의 발사속도는 요격기 기준 45 m/s입니다. 발사 후에는 중력을 받는 탄도체로 계산하며, 그물과 표적의 거리가 2 m 이내이면 포획 성공으로 판정합니다. Physics substep 사이를 통과하는 명중도 선분–구 교차로 검사합니다.
+
+### 유도·발사 결정
+
+```mermaid
+flowchart LR
+    T["무작위 경로·기동의 표적"] --> E["RotorPy 3D 요격 환경"]
+    I["요격 드론"] --> E
+    E --> O["상대 위치·속도 등 26차원 관측"]
+    O --> P["PN 유도 + RL 발사각 2개"]
+    O --> X["E2E-PPO: RL 유도 3개 + 발사각 2개"]
+    P --> G{"거리·접근속도 gate"}
+    X --> G
+    G --> N["중력 탄도 그물 1회 발사"]
+    N --> H{"2 m 이내 포획?"}
+    H -->|예| S["명중"]
+    H -->|아니요| M["실패·근접도 기록"]
 ```
 
-`mode=pn`의 action은 `[LOS 좌우 발사각, LOS 상하 발사각]` 2개다. PN 유도와 발사 시점은 규칙 기반이다.
-`mode=e2e`는 `[a_LOS, a_horizontal, a_vertical, LOS 좌우 발사각, LOS 상하 발사각]` 5개다.
-두 방식은 동일한 RotorPy
-quadrotor, 표적 분포, capture 조건, observation, reward를 쓴다.
+| 구분 | PN + RL 조준: 주 실험 | E2E-PPO: 예비 대조군 |
+|---|---|---|
+| 유도 가속도 | PN + 8 m/s 속도 추종 규칙 | RL이 LOS 기준 3축 가속도 결정 |
+| 발사 시점 | 공통 규칙 기반 gate | 공통 규칙 기반 gate |
+| 발사 방향 | RL이 LOS 기준 좌우·상하각 결정 | RL이 LOS 기준 좌우·상하각 결정 |
+| Action 차원 | 2 | 5 |
 
-관측은 정규화된 ground-truth
-`[p_T-p_I, v_T-v_I, p_I, v_I, q_I, omega_I, a_I_previous, time, launch_used, gate_open, curriculum_stage]` (26차원)이다.
-정상 논문 실험에는 timeout이 없다. hit, device miss, target sphere exit,
-interceptor sphere exit만 `terminated=True`다. `debug_max_steps`를 켠 경우에만
-개발용 `truncated=True`가 생기며 PPO는 그 실제 final observation으로 bootstrap한다.
+발사 gate는 매 제어 step에 검사합니다. **표적–요격기 거리 ≤ 설정 발사거리**이면서 **closing speed ≥ 5 m/s**가 되는 첫 순간 자동 발사합니다. 발사각 범위는 LOS 기준 좌우 ±30°, 상하 ±20°입니다. 주 실험은 발사거리를 15–50 m에서 5 m씩 바꾸고, 각 거리·알고리즘 조합을 독립적으로 학습했습니다.
 
-## 설치와 실행
+관측값은 상대 위치·속도, 요격기의 위치·속도·자세·각속도·직전 가속도, 경과시간, 발사 여부, gate 및 curriculum 단계로 이루어진 **26차원 ground-truth 상태**입니다. 표적 기동의 숨은 진폭·주파수·OU 상태는 직접 제공하지 않습니다. 일반 step에는 거리 진전과 시간 감점, 명중에는 시간 보너스, 실패에는 페널티와 그물–표적 최소거리에 따른 near-miss 항을 적용합니다. 명중·실패·공역 이탈은 `terminated`; 개발용 step 제한만 `truncated`로 구분합니다.
+
+## 3. 평가 결과
+
+다음은 **학습 seed 0**, 거리별 최고 검증 checkpoint를 별도의 **10,000개 평가 seed(20,000–29,999)**에서 시험한 명중률입니다. 학습 중에는 고정된 20개 seed로 5,000 step마다 평가하고, 95% 이상이 10회 연속이면 조기 종료했습니다. 최대 학습 예산은 조합당 400만 환경 step입니다.
+
+| 알고리즘 | 15 m | 20 m | 25 m | 30 m | 35 m | 40 m | 45 m | 50 m |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| PPO | 100.00 | 95.66 | 96.63 | 88.03 | 97.19 | 91.65 | 85.51 | 89.10 |
+| A2C | 100.00 | 100.00 | 99.65 | 87.11 | 93.56 | 95.39 | 83.09 | 77.35 |
+| DDPG | 100.00 | 99.98 | 99.76 | 97.98 | 98.26 | 97.74 | 98.17 | 97.67 |
+| TD3 | 100.00 | 99.99 | 92.34 | 99.37 | 99.12 | 98.91 | 98.05 | 97.00 |
+| SAC | 100.00 | 100.00 | 99.34 | 95.33 | 97.06 | 91.16 | 88.33 | 81.82 |
+
+단위: %. 아래 그래프는 위 표와 동일한 데이터입니다.
+
+```mermaid
+xychart-beta
+    title "10,000-seed interception success"
+    x-axis "Launch distance (m)" [15, 20, 25, 30, 35, 40, 45, 50]
+    y-axis "Success (%)" 70 --> 100
+    line "PPO" [100, 95.66, 96.63, 88.03, 97.19, 91.65, 85.51, 89.10]
+    line "A2C" [100, 100, 99.65, 87.11, 93.56, 95.39, 83.09, 77.35]
+    line "DDPG" [100, 99.98, 99.76, 97.98, 98.26, 97.74, 98.17, 97.67]
+    line "TD3" [100, 99.99, 92.34, 99.37, 99.12, 98.91, 98.05, 97.00]
+    line "SAC" [100, 100, 99.34, 95.33, 97.06, 91.16, 88.33, 81.82]
+```
+
+DDPG와 TD3는 50 m에서도 각각 97.67%, 97.00%를 기록했습니다. SAC는 35 m 이후 명중률이 낮아졌으며, PPO·A2C의 장거리 결과도 거리별로 변동했습니다. 거리마다 별도 모델을 학습했으므로 성공률이 반드시 단조감소하지는 않습니다. **단일 학습 seed의 결과이고, 검증 checkpoint 선택에는 20개 고정 seed를 썼으므로 알고리즘의 일반적 우열이나 성능 차이의 원인을 확정할 수는 없습니다.** E2E-PPO는 예비 실험으로만 다루며 위 거리별 표에는 포함하지 않았습니다.
+
+## 4. 재현 및 한계
 
 ```bash
 python -m pip install -r requirements.txt
 python train.py --mode pn --physics-engine rotorpy --sanity
-python train.py --mode pn --physics-engine rotorpy --seed 0
-python train.py --mode e2e --physics-engine rotorpy --seed 0
+python train.py --agent ppo --mode pn --launch-distance 30 --seed 0 --physics-engine rotorpy
+python evaluate.py --agent ppo --mode pn --launch-distance 30 --training-seed 0 --checkpoint stage1_best --seed-start 20000 --num-seeds 10000 --physics-engine rotorpy
 ```
 
-`--total-steps`를 생략하면 수동으로 중지할 때까지 학습하며, `Ctrl+C`로 중지해도
-`last.pt`를 저장한다. 유한한 smoke test에만 `--total-steps`를 지정한다.
+`config.py`는 공통 물리·보상·평가 조건, `interception_env.py`는 환경·표적·PN·그물, `agent/`의 각 파일은 해당 알고리즘과 하이퍼파라미터를 담습니다. `train.py`는 학습, `evaluate.py`는 저장된 모델 평가, `record.py`는 궤적·영상 기록에 사용합니다. 학습 산출물 `runs/`는 저장소에 포함하지 않습니다.
 
-빠른 문법·환경 점검만 할 때는 `--physics-engine simple`을 쓸 수 있지만 논문 결과에는
-반드시 `--physics-engine rotorpy`를 쓴다. 같은 mode/seed 결과를 다시 만들려면
-`--overwrite`를 명시한다.
-
-```bash
-python record.py --mode pn --seed 0 --scenario-seed 10000
-```
-
-MP4에는 `ffmpeg`가 필요하며, 없더라도 trajectory `.npz`는 먼저 저장된다.
-
-타겟의 random성은 entry 위치 route방향 A_horizontal, A_vertical, ω_horizontal, ω_vertical ou에 의해서만 결정되고 \(A\sin(\omega t+\phi)\)의 파이는 0으로 둔다
-이는 타겟이 공역에 들어오기 전까지는 기본 운동을 하다가 공역에 들어오고나서부터 회피기동을 한다고 해석할수 있다.
-그리고 agent에서 reinforce는 뺌
-==================================================
-09/16 v1결과: 접근 reward를 주니까 pn agent들이 그냥 타겟을 잘 따라가기만 하고 쏘지를 않음. 심지어는 앞으로 가서 타겟 배웅 나갔다가 다시 유턴해서 타겟을 따라가기만 함. 가까이로 유도함으로 인해 받는 보상보다 그냥 시간이 지나면서 기본적으로 깎이는 페널티가 더 커야함
-일반 step:
-r = 0.5 * (d_previous - d_current) / 100 - 0.005
-
-명중:
-r_hit = 10 + 5 * clip(1 - capture_time / 25, 0, 1)
-
-그물 miss:
-r_miss = -12 + 4 * clip(1 - min_net_distance / 10, 0, 1)
-
-미발사 상태로 타겟 탈출:
-r_target_exit = -15
-
-요격기 공역 이탈:
-r_interceptor_exit = -15
-
-가속도·jerk 페널티는 제거했지만 물리적 제한은 유지한다.
-==========================================================
-0918 v2결과: pn에서는 여전히 마중나갔다가 요격 안하고 뒤꽁무니만 쫓는 현상이 나타남. target_exit으로 끝남 -> 아예 접근으로 인한 보상을 없애야 할것으로 예상됨
-e2e에서는 요격기가 이상한 곳으로 가서 intercepter_exit으로 끝남. 학습이 부족해서인 거 같기는 한데 학습 부족 문제가 아니라면, "어차피 쏴도 못맞출거  에피소드를 일찍 끝내서 누적 페널티를 적게 받자" 정책을 택한 거 같음.
-그리고 내가 실수한게 지금까지 발사각과 e2e 가속도를 los기준이 아니라 world기준 각도와 가속도를 출력하도록 하고 있었음. 이것들을 los기준으로 바꾸었음.
-
-상대 방위각:
-action = -1 → -180도
-action =  0 → LOS 정면
-action = +1 → +180도
-
-상대 고도각:
-action = -1 → LOS보다 아래로 90도
-action =  0 → LOS 정면
-action = +1 → LOS보다 위로 90도
-
-그리고 지금까지는
-physics_substeps = control_dt / physics_dt
-                 = 0.05 / 0.01
-                 = 5번
-이렇게 했었는데 학습이 너무 느려서 self.physics_dt = self.control_dt / 3.0로 바꿈. 이제는 substep이 5가 아니라 3임.
-일단 jerk제한은 그대로 둠. 주말이라 각 경우에 대해 step을 300만이 아니라 500만으로 늘림.
-===================================================
-09/21 구현 사항
-학습 실패의 주요 원인을 희소한 명중 보상, 조기 발사, 불완전한 관측값 및 발사 후 무의미한 transition으로 판단하여 다음과 같이 환경을 수정했다.
-- Observation에 정규화된 요격기 위치, 직전 가속도 및 episode 시간을 추가했다.
-- 발사 후에는 agent action과 요격기 운동·보상 계산을 중단한다.
-- 발사 후 환경 내부에서 타겟과 탄도 그물만 hit/miss까지 시뮬레이션하고 하나의 terminal transition을 반환한다.
-- 아래의 발사 gate·RL 발사 시점·residual 설계는 09/22 분석 뒤 현재의 규칙 기반 발사 시점과 직접 발사각 action으로 대체했다.
-- 빗나간 경우에도 min_net_distance가 작을수록 보상을 받도록 40m 범위의 연속 near-miss 보상을 적용한다.
-- 평가 CSV에 gate 진입률, 발사율·시점·거리, 최소 그물 거리 및 종료 원인별 비율을 기록한다.
-최종 평가에서는 실제 조건인 capture radius 2m와 전체 타겟 기동 조건을 그대로 사용한다.
-그리고 rotorpy버전이 서버랑 로컬이랑 달라서 서버 업데이트 함
-Python 3.10.20
-RotorPy 2.1.3
-NumPy 2.2.6
-SciPy 1.15.3
-=======================================
-## 09/22 실패 분석 반영
-
-- PN은 유도와 발사 시점을 규칙 기반으로 고정하고, RL은 LOS 기준 좌우 ±30도·상하 ±20도의 발사 방향을 직접 결정한다. 발사는 `거리 <= 15 m`이고 `closing speed >= 5 m/s`인 첫 step에 실행한다.
-- E2E stage 0은 RL 유도와 규칙 기반 탄도 조준을 사용한다. 평가 성공률 80%를 2회 연속 만족하면 stage 1로 넘어가 RL이 유도와 발사 방향을 함께 결정한다.
-- 사용되지 않는 발사각 action은 PPO/A2C의 policy loss에서 제외하고 DDPG/TD3/SAC에서는 0으로 masking한다. 단계 전환 시 off-policy replay buffer를 비운다.
-- 단계별 최고 모델은 `stage0_best.pt`, `stage1_best.pt`로 저장하고, 평가 CSV에는 rule/RL 조준 사용률을 기록한다.
-
-## 09/23 PPO 수치 안정화
-
-- `-log_prob(old action)`을 entropy로 사용하던 오류를 Gaussian entropy로 수정했다.
-- tanh-Gaussian log probability의 Jacobian을 수치적으로 안정적인 식으로 계산한다.
-- PPO/A2C의 `log_std`를 `[-5, 1]`, gradient norm을 `0.5`로 제한한다.
-==========================================
-## 0924
-현재 상태 다시 정리
-PN:한 단계만 사용
-Stage 1: rl_los_aim
-유도              = PN 규칙 기반
-발사 시점         = 규칙 기반
-발사 방향         = RL
-action            = [LOS 좌우각, LOS 상하각]
-
-발사조건
-거리 ≤ 15 m
-closing speed ≥ 5 m/s
-
-E2E:
-Stage 0: guidance_with_rule_aim
-유도              = RL
-발사 시점         = 규칙 기반
-발사 방향         = 탄도해 규칙
-학습 action       = 가속도 3개
-발사각 2개        = masking
-
-평가 성공률 80% 이상을 2회 연속 달성하면
-Stage 1: rl_los_aim
-유도              = RL
-발사 시점         = 규칙 기반
-발사 방향         = RL
-학습 action       = 가속도 3개 + 발사각 2개
-
-###  수정 사항
-
-- E2E 발사 step에서 실제로 사용되지 않는 가속도 action까지 학습되던 mask 오류를 수정했다.
-- Stage 0은 최소 200만 step 학습하고, 성공률과 gate 진입률이 모두 90% 이상인 평가를 5회 연속 통과해야 Stage 1로 전환한다.
-- Stage 1 진입 전에 analytic ballistic angle로 발사각 출력을 짧게 imitation 학습한다. 이후 유도 network를 동결하고 발사각만 학습한다.
-- Stage 1을 최소 100만 step 학습한 뒤 같은 90%·5회 조건을 만족하면 Stage 2로 전환한다. Stage 2에서는 전체 network를 learning rate 1e-4로 joint fine-tuning한다.
-- 단계 전환 시 critic과 optimizer를 초기화하며, off-policy agent는 이전 단계의 replay buffer도 비운다. `stage2_best.pt` 저장과 `last.pt` 재개 학습을 지원한다.
-- PN은 모든 agent에서 동일한 PN 유도, 15 m·closing speed 5 m/s gate, 2차원 LOS 발사각, 보상과 평가 seed를 사용한다.
+현재 연구는 시뮬레이터의 ground-truth 관측과 추상화된 단발 그물을 사용합니다. 실제 센서 오차, 그물 전개·접촉 물리, 하드웨어 실험은 포함하지 않으므로 실기체 성능으로 바로 해석할 수 없습니다.
