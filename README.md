@@ -71,7 +71,7 @@ xychart-beta
 
 DDPG와 TD3는 50 m에서도 각각 97.67%, 97.00%를 기록했습니다. SAC는 35 m 이후 명중률이 낮아졌으며, PPO·A2C의 장거리 결과도 거리별로 변동했습니다. 거리마다 별도 모델을 학습했으므로 성공률이 반드시 단조감소하지는 않습니다. **단일 학습 seed의 결과이고, 검증 checkpoint 선택에는 20개 고정 seed를 썼으므로 알고리즘의 일반적 우열이나 성능 차이의 원인을 확정할 수는 없습니다.** E2E-PPO는 예비 실험으로만 다루며 위 거리별 표에는 포함하지 않았습니다.
 
-## 4. 재현 및 한계
+## 4. 재현
 
 ```bash
 python -m pip install -r requirements.txt
@@ -80,6 +80,4 @@ python train.py --agent ppo --mode pn --launch-distance 30 --seed 0 --physics-en
 python evaluate.py --agent ppo --mode pn --launch-distance 30 --training-seed 0 --checkpoint stage1_best --seed-start 20000 --num-seeds 10000 --physics-engine rotorpy
 ```
 
-`config.py`는 공통 물리·보상·평가 조건, `interception_env.py`는 환경·표적·PN·그물, `agent/`의 각 파일은 해당 알고리즘과 하이퍼파라미터를 담습니다. `train.py`는 학습, `evaluate.py`는 저장된 모델 평가, `record.py`는 궤적·영상 기록에 사용합니다. 학습 산출물 `runs/`는 저장소에 포함하지 않습니다.
-
-현재 연구는 시뮬레이터의 ground-truth 관측과 추상화된 단발 그물을 사용합니다. 실제 센서 오차, 그물 전개·접촉 물리, 하드웨어 실험은 포함하지 않으므로 실기체 성능으로 바로 해석할 수 없습니다.
+`config.py`는 공통 물리·보상·평가 조건, `interception_env.py`는 환경·표적·PN·그물, `agent/`의 각 파일은 해당 알고리즘과 하이퍼파라미터를 담습니다. `train.py`는 학습, `evaluate.py`는 저장된 모델 평가, `record.py`는 궤적·영상 기록에 사용합니다. 
