@@ -57,20 +57,12 @@ flowchart LR
 
 단위: %. 아래 그래프는 위 표와 동일한 데이터입니다.
 
-```mermaid
-xychart-beta
-    title "10,000-seed interception success"
-    x-axis "Launch distance (m)" [15, 20, 25, 30, 35, 40, 45, 50]
-    y-axis "Success (%)" 70 --> 100
-    line "PPO" [100, 95.66, 96.63, 88.03, 97.19, 91.65, 85.51, 89.10]
-    line "A2C" [100, 100, 99.65, 87.11, 93.56, 95.39, 83.09, 77.35]
-    line "DDPG" [100, 99.98, 99.76, 97.98, 98.26, 97.74, 98.17, 97.67]
-    line "TD3" [100, 99.99, 92.34, 99.37, 99.12, 98.91, 98.05, 97.00]
-    line "SAC" [100, 100, 99.34, 95.33, 97.06, 91.16, 88.33, 81.82]
-```
+
 <img width="502" height="309" alt="image" src="https://github.com/user-attachments/assets/20f461c0-eab9-443f-bf6d-ea0d6960fc60" />
 <img width="560" height="355" alt="image" src="https://github.com/user-attachments/assets/05b5dee1-704a-40c5-9abc-ba1d4f702d94" />
+5개 agents와 룰 기반 요격 비교
 <img width="530" height="343" alt="image" src="https://github.com/user-attachments/assets/e68c89ab-16d5-44d7-80f2-5488da665073" />
+5개 agents끼리만 비교
 
 
 DDPG와 TD3는 50 m에서도 각각 97.67%, 97.00%를 기록했습니다. SAC는 35 m 이후 명중률이 낮아졌으며, PPO·A2C의 장거리 결과도 거리별로 변동했습니다. 거리마다 별도 모델을 학습했으므로 성공률이 반드시 단조감소하지는 않습니다. **단일 학습 seed의 결과이고, 검증 checkpoint 선택에는 20개 고정 seed를 썼으므로 알고리즘의 일반적 우열이나 성능 차이의 원인을 확정할 수는 없습니다.** E2E-PPO는 예비 실험으로만 다루며 위 거리별 표에는 포함하지 않았습니다.
