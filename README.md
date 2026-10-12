@@ -14,6 +14,8 @@ RotorPy의 쿼드로터 동역학을 사용하는 환경에서 비례항법(Prop
 - 두 기체에 RotorPy Crazyflie 모델을 사용합니다. 제어 간격은 0.05 s이고, 한 제어 step을 물리 계산 3회로 나눕니다.
 - 표적은 구면의 무작위 지점에서 진입해 약 135° 떨어진 탈출 방향으로 이동합니다. 기준 속도는 8 m/s이며, 수평·수직 사인 기동과 시간적으로 상관된 OU 잡음을 더합니다. 기동 진폭·주파수와 경로는 episode마다 달라집니다.
 - 그물의 발사속도는 요격기 기준 45 m/s입니다. 발사 후에는 중력을 받는 탄도체로 계산하며, 그물과 표적의 거리가 2 m 이내이면 포획 성공으로 판정합니다. Physics substep 사이를 통과하는 명중도 선분–구 교차로 검사합니다.
+  <img width="700" height="600" alt="seed_0_stage1_best_rollout_20003" src="https://github.com/user-attachments/assets/925ba2ef-bbef-4f9f-b028-95ebc0c2cc27" />
+
 
 ### 유도·발사 결정
 
