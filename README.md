@@ -85,14 +85,41 @@ python evaluate.py --agent ppo --mode pn --launch-distance 30 --training-seed 0 
 
 
 ## 5. 추가 실험: 평가 성공률에 따른 near-miss 보상 감소
-SAC·TD3를 대상으로 발사거리 15~50m를 5m 간격으로 실험하였다. 기존에는 4로 고정했던 실패 시 near-miss 보상의 가중치 β만 학습 성능에 따라 점진적으로 감소시켰다.
-- 초기 10,000 step 동안 β=4를 유지한다.
-- 5,000 step마다 기존과 동일한 validation seed 20개로 명중률을 측정한다.
-- 평가 명중률의 지수이동평균(EMA)을 이용하여 다음 가중치를 결정한다. 명중률은 0~1 범위이며, EMA는 첫 평가값으로 초기화한다
-p_EMA = 0.9 * p_EMA_previous + 0.1 * validation_success_rate
-beta_target = 4 * clip(1 - p_EMA / 0.95, 0, 1)
-beta_new = min(beta_previous, max(beta_target, beta_previous - 0.5))
 
-near_miss_reward = beta * clip(1 - d_min_net / 40, 0, 1)
+SAC·TD3를 대상으로 발사거리 15~50m를 5m 간격으로 실험하였다. 기존에는 4로 고정했던 **실패 시 near-miss 보상의 가중치**를 학습 성능에 따라 점진적으로 감소시켰다.
+
+초기 10,000 step 동안 가중치 $\beta=4$를 유지한다. 이후 5,000 step마다 동일한 validation seed 20개로 명중률을 측정하고, 명중률의 지수이동평균(EMA)에 따라 가중치를 갱신한다.
+
+$$
+\bar{p}_k = 0.9\bar{p}_{k-1} + 0.1p_k
+$$
+
+$$
+\beta_k^{\mathrm{target}}
+= 4\,\operatorname{clip}\left(1-\frac{\bar{p}_k}{0.95},\,0,\,1\right)
+$$
+
+$$
+\beta_k
+= \min\left(
+\beta_{k-1},
+\max\left(\beta_k^{\mathrm{target}},\,\beta_{k-1}-0.5\right)
+\right)
+$$
+
+$$
+r_{\mathrm{near\text{-}miss}}
+= \beta_k\,\operatorname{clip}\left(
+1-\frac{d_{\min,\mathrm{net}}}{40},\,0,\,1
+\right)
+$$
+
+여기서 $p_k$는 k번째 validation 명중률(0~1), $\bar{p}_k$는 명중률의 EMA, $d_{\min,\mathrm{net}}$은 발사 후 그물과 표적 사이의 최소거리(m)이다. EMA는 첫 평가 명중률로 초기화한다.
+
+가중치는 평가 한 번에 최대 0.5만 감소하며, 성능이 떨어져도 다시 증가하지 않는다. 하한은 0이지만 조기종료 시점에 따라 반드시 0까지 감소하는 것은 아니다.
+
+Replay buffer에 저장된 과거 transition의 보상도 현재 가중치로 재계산하였다. 환경·나머지 보상항·알고리즘별 하이퍼파라미터와 종료조건은 기존 실험과 동일하게 유지하였다. 최대 학습량은 400만 step이며, validation 성공률 95% 이상이 10회 연속이면 조기종료한다.
+
+평가 시에는 기존 보상 설정인 $\beta=4$를 유지하였다. 최종 성능은 기존 실험과 동일한 독립 test seed 20,000~29,999의 명중률로 비교하였으며, 이 test 결과는 가중치 조절에 사용하지 않았다.
 <img width="2420" height="1496" alt="image" src="https://github.com/user-attachments/assets/b28952b0-5e73-488c-96c8-5060ab318e7a" />
-
+45m를 제외한 대부분의 구간에서 기존 결과보다 정확도가 높게 도출되었다. 정확도가 유의미하게 향상된 것은 아니지만 reward shaping의 효과를 확인할 수 있었고, 어떻게 shaping해야 더 좋은 성능을 낼 수 있는지도 추후 연구할만한 가치가 있다.
