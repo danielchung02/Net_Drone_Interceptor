@@ -81,3 +81,18 @@ python evaluate.py --agent ppo --mode pn --launch-distance 30 --training-seed 0 
 ```
 
 `config.py`는 공통 물리·보상·평가 조건, `interception_env.py`는 환경·표적·PN·그물, `agent/`의 각 파일은 해당 알고리즘과 하이퍼파라미터를 담습니다. `train.py`는 학습, `evaluate.py`는 저장된 모델 평가, `record.py`는 궤적·영상 기록에 사용합니다. 
+
+
+
+## 5. 추가 실험: 평가 성공률에 따른 near-miss 보상 감소
+SAC·TD3를 대상으로 발사거리 15~50m를 5m 간격으로 실험하였다. 기존에는 4로 고정했던 실패 시 near-miss 보상의 가중치 β만 학습 성능에 따라 점진적으로 감소시켰다.
+- 초기 10,000 step 동안 β=4를 유지한다.
+- 5,000 step마다 기존과 동일한 validation seed 20개로 명중률을 측정한다.
+- 평가 명중률의 지수이동평균(EMA)을 이용하여 다음 가중치를 결정한다. 명중률은 0~1 범위이며, EMA는 첫 평가값으로 초기화한다
+p_EMA = 0.9 * p_EMA_previous + 0.1 * validation_success_rate
+beta_target = 4 * clip(1 - p_EMA / 0.95, 0, 1)
+beta_new = min(beta_previous, max(beta_target, beta_previous - 0.5))
+
+near_miss_reward = beta * clip(1 - d_min_net / 40, 0, 1)
+<img width="2420" height="1496" alt="image" src="https://github.com/user-attachments/assets/b28952b0-5e73-488c-96c8-5060ab318e7a" />
+
